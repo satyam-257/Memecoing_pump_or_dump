@@ -1,4 +1,4 @@
-"""Generates the multi-level Expected Value competition notebook for Kaggle execution."""
+"""Generates the upgraded Two-Stage Decoupled Gatekeeper competition notebook for Kaggle execution."""
 import os
 import nbformat as nbf
 
@@ -18,23 +18,33 @@ nb['metadata'] = {
 cells = []
 
 # Title & Abstract
-cells.append(nbf.v4.new_markdown_cell("""# Quantitative Microstructure & Dynamic Multi-Level Take-Profit Engine
+cells.append(nbf.v4.new_markdown_cell("""# Decoupled Two-Stage Gatekeeper & Multi-Level Expected Utility Engine
 ### Competition: [Memecoins: Pump or Dump? Predict Pump.fun Launches on Solana](https://www.kaggle.com/competitions/memecoins-pump-or-dump)
 
 ---
 
 ## Research Abstract & Quantitative Architecture
 
-This notebook implements an advanced quantitative trading system for newly migrated Solana memecoin pools (Pump.fun to PumpSwap AMM). At exactly $t = 60\\text{s}$ post-migration, the system evaluates high-frequency microstructure and participant reputation to determine whether to enter a long position and dynamically select an optimal take-profit target $tp \\in [3, 100]$ over a 1-hour holding window, or skip at zero cost ($tp = 0$).
+This notebook implements a decoupled two-stage quantitative decision system for newly migrated Solana memecoin pools (Pump.fun to PumpSwap AMM). At exactly $t = 60\\text{s}$ post-migration, the system evaluates high-frequency microstructure and participant reputation to determine whether to enter a long position and dynamically select an optimal take-profit target $tp \\in [3, 100]$ over a 1-hour holding window, or skip at zero cost ($tp = 0$).
 
 ### Core Quantitative Pillars:
-1. **WSOL Base Token Inversion Correction**: On PumpSwap pools where WSOL is the base token, `'B'` swaps dump the memecoin for SOL. This pipeline corrects the trade direction using pool pair tokens.
-2. **Three-Window Order Flow Dynamics**: Decomposes the first minute into $W_0 \\in [0, 15\\text{s})$, $W_1 \\in [15, 30\\text{s})$, $W_2 \\in [30, 60\\text{s}]$ to measure late liquidity acceleration (`flow_accel`) and buy pressure delta (`bp_delta`).
-3. **Causal Empirical Bayes Reputation with Recency Decay**: Tracks early participant and deployer success rates under a strict 1-hour resolution embargo ($mt_j \\le mt_i - 3600$) with a 5-day exponential decay half-life.
-4. **Multi-Level Expected Value Maximization**:
-   Rather than hardcoding static $tp = 5.0$, the model predicts monotonic probabilities across multiple targets $\\text{LEVELS} = (3, 4, 5, 7, 10, 15)$ and selects:
-   $$tp^*(\mathbf{x}) = \\arg\\max_{k \\in \\text{LEVELS}} \\mathbb{E}[\\text{PnL}(k \\mid \\mathbf{x})]$$
-   subject to a risk-adjusted daily Sharpe margin hurdle.
+1. **Stage 1: Precision Gatekeeper (Rug-Pull & Failure Filter)**:
+   - Target: $P(\\max(X) \\ge 3.0)$
+   - Out-of-fold probability calibration via Platt scaling (logistic regression on holdout logits).
+   - High conviction hurdle $\\tau$ isolating only 2-3 highest-conviction daily opportunities, bypassing the $-0.30$ SOL transaction drain.
+2. **Stage 2: Quantile / Expected Utility Optimizer**:
+   - Rather than predicting raw peak price, evaluates the expected payoff curve directly across discrete grid $K = (3, 4, 5, 7, 10, 15)$:
+     $$\\mathbb{E}[\\text{PnL}(k)] = P(\\max(X) \\ge k) \\cdot (k - 1.30) + (1 - P(\\max(X) \\ge k)) \\cdot \\text{miss\\_payoff}(k)$$
+   - Enforces strict probability monotonicity via `np.minimum.accumulate`.
+   - Allocates $k^* = \\arg\\max_{k \\in K} \\mathbb{E}[\\text{PnL}(k)]$.
+3. **High-Frequency Microstructure & On-Chain Graph Signals**:
+   - Gini concentration of early buy volumes & wash trading indicators (`unique_buyers_ratio`).
+   - Launch block slot sniping share (slots 0-2).
+   - Second-derivative volume acceleration ($d^2 V / dt^2$).
+   - Buy/Sell volume and transaction ratios with fast-flipper dump tracking.
+4. **Causal Creator History & Participant Reputation**:
+   - Strict 1-hour resolution embargo ($mt_j \\le mt_i - 3600$) with zero future leakage.
+   - Deployer historical launch counts, median/max peak multiples, and $3\\times/5\\times$ hit rates.
 """))
 
 # Cell 1: Environment Setup & Constants
@@ -42,66 +52,46 @@ cells.append(nbf.v4.new_code_cell("""import os, sys, glob, re, time, gc, warning
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
+from sklearn.linear_model import LogisticRegression
 import matplotlib.pyplot as plt
 
 warnings.filterwarnings('ignore')
 
-# Set deterministic seed for full reproducibility
 SEED = 42
 np.random.seed(SEED)
-os.environ['PYTHONHASHSEED'] = str(SEED)
 
-# Token & Market Constants
+def find_data_dir():
+    candidates = [
+        '/kaggle/input/competitions/memecoins-pump-or-dump',
+        '/kaggle/input/memecoins-pump-or-dump',
+        'data',
+        '../data'
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return 'data'
+
+DATA = find_data_dir()
+print(f"Dataset root resolved to: {DATA}")
+
 WSOL = "So11111111111111111111111111111111111111112"
-COST = 0.30          # Round-trip execution friction in SOL (fees + slippage buffer)
-LEVELS = [3.0, 4.0, 5.0, 7.0, 10.0, 15.0]  # Take-profit hurdle grid
-WIN = 3600           # Evaluation holding horizon (1 hour in seconds)
-EMBARGO = 3600       # Embargo window before validation day start
-HOLD_DAYS = 5        # Training days held back for hurdle calibration
-TAU_DECAY = 5 * 86400 # 5-day exponential half-life for reputation recency decay
-
-# Multi-seed ensemble configuration
+COST = 0.30
+LEVELS = [3.0, 4.0, 5.0, 7.0, 10.0, 15.0]
+WIN = 3600
+EMBARGO = 3600
+HOLD_DAYS = 5
 SEEDS = [42, 101, 2024, 7, 777]
 
-# Resolve data path across Kaggle and local environments
-CANDIDATES = [
-    '/kaggle/input/competitions/memecoins-pump-or-dump',
-    '/kaggle/input/memecoins-pump-or-dump',
-    'data',
-    '../data'
-]
-DATA = next(p for p in CANDIDATES if os.path.exists(p))
-print(f"Data root resolved to: {DATA}")
-"""))
-
-# Cell 2: PnL Function Definition
-cells.append(nbf.v4.new_markdown_cell("""## 1. PnL Payoff Evaluation Operator
-
-The competition metric is total simulated trading PnL:
-$$\\Pi(tp) = \\begin{cases}
-0, & \\text{if } tp = 0 \\\\
-tp - 1.30, & \\text{if } tp \\in [3, 100] \\text{ and } \\widetilde{M} \\ge tp \\\\
-\\max(\\text{final\\_x} - 1.30, -1.0), & \\text{if } tp \\in [3, 100] \\text{ and } \\widetilde{M} < tp
-\\end{cases}$$
-"""))
-
-cells.append(nbf.v4.new_code_cell("""def pnl(tp, max_x, final_x, cost=COST):
+def pnl(tp, max_x, final_x, cost=COST):
     tp = np.asarray(tp, float)
     hit = (max_x >= tp) & (tp > 0)
     held = np.maximum(final_x - 1.0 - cost, -1.0)
     return np.where(tp <= 0, 0.0, np.where(hit, tp - 1.0 - cost, held))
 """))
 
-# Cell 3: Data Ingestion & Launch Features
-cells.append(nbf.v4.new_markdown_cell("""## 2. Ingestion & Token Launch Feature Extraction
-
-Extracting pre-trade launch attributes from `pumpfun_token_creation.csv` and `pfamm_migrations.csv`:
-- Deployer initial balance (`dev_balance`)
-- Bundle mechanics: `bundle_size`, `bundled_buys`, `bs_ops`, `bs_amt_sum`
-- Compute stats: `gas_used`, `amount_of_instructions`
-- Program version: `token2022` flag
-- Token name and symbol structure
-"""))
+# Cell 2: Creation Metadata Features
+cells.append(nbf.v4.new_markdown_cell("""## 1. Creation Metadata & Deployer Funding Profile"""))
 
 cells.append(nbf.v4.new_code_cell("""train = pd.read_csv(f'{DATA}/train.csv')
 test = pd.read_csv(f'{DATA}/test.csv')
@@ -115,7 +105,6 @@ for _d in (train, test):
 print(f"Train universe: {len(train):,} tokens over {train.day.nunique()} days")
 print(f"Test universe:  {len(test):,} tokens on {test.day.iloc[0]}")
 
-# Process token creation features
 cre_path = f'{DATA}/pumpfun_token_creation.csv'
 if not os.path.exists(cre_path):
     cre_path = f'{DATA}/03_sample_pumpfun_token_creation.csv'
@@ -124,13 +113,23 @@ cre = pd.read_csv(cre_path).drop_duplicates('mint').copy()
 name = cre.name.fillna('').astype(str)
 sym = cre.symbol.fillna('').astype(str)
 bs = cre.bundle_structure.fillna('').astype(str)
+url = cre.url.fillna('').astype(str)
 
 M = pd.DataFrame({'mint': cre.mint, 'creator': cre.creator.fillna('').astype(str)})
 M['name_len'] = name.str.len()
 M['symbol_len'] = sym.str.len()
 M['name_upper'] = name.apply(lambda s: sum(ch.isupper() for ch in s) / max(len(s), 1))
 M['name_eq_symbol'] = (name.str.lower().str[:4] == sym.str.lower().str[:4]).astype(np.int8)
+M['symbol_is_short'] = (M['symbol_len'] <= 4).astype(np.int8)
 
+# Deployer platforms & custom URL domains
+is_ipfs = url.str.contains(r'ipfs\\.io|pinata', regex=True).astype(np.int8)
+is_bot = url.str.contains(r'j7tracker|vortexdeployer|rapidlaunch|uxento|sdfgsdfsdf|usepaid|agencypad', regex=True).astype(np.int8)
+M['is_ipfs_url'] = is_ipfs
+M['is_deployer_bot_url'] = is_bot
+M['has_custom_domain'] = ((url != '') & (is_ipfs == 0) & (is_bot == 0)).astype(np.int8)
+
+# Bundle structure analysis
 M['bs_ops'] = bs.str.split().str.len().fillna(0)
 M['bs_len'] = bs.str.len().fillna(0)
 M['bs_buys'] = bs.apply(lambda s: len(re.findall(r'\\dB\\d', s))).astype(np.int16)
@@ -145,6 +144,10 @@ for c_ in ['gas_used', 'amount_of_instructions', 'amount_of_lookup_reads', 'amou
     if c_ in cre.columns:
         M[c_] = pd.to_numeric(cre[c_], errors='coerce').fillna(0).values
 
+M['dev_balance_log'] = np.log10(np.maximum(M['dev_balance'].values, 0) + 1.0)
+M['is_micro_dev_balance'] = (M['dev_balance'].values < 0.05 * 1e9).astype(np.int8)
+M['bundle_buy_density'] = M['bundled_buys_count'].values / np.maximum(M['bundle_size'].values, 1)
+
 if 'token_program' in cre.columns:
     M['token2022'] = (~cre.token_program.fillna('').astype(str).str.startswith('Tokenkeg')).astype(np.int8)
 else:
@@ -152,39 +155,44 @@ else:
 
 M['created_ts'] = pd.to_numeric(cre.created_ts, errors='coerce').fillna(0).values
 
-# Ingest migration fee and liquidity attributes
 mig_path = f'{DATA}/pfamm_migrations.csv'
 if not os.path.exists(mig_path):
     mig_path = f'{DATA}/02_sample_pfamm_migrations.csv'
+
 if os.path.exists(mig_path):
     mig = pd.read_csv(mig_path, usecols=['mint', 'sol_amount', 'mint_amount', 'pool_migration_fee']).drop_duplicates('mint')
     M = M.merge(mig, on='mint', how='left')
     for c_ in ['sol_amount', 'mint_amount', 'pool_migration_fee']:
         if c_ in M.columns:
             M[c_] = pd.to_numeric(M[c_], errors='coerce').fillna(0).values
+    M['sol_migration_ratio'] = M['sol_amount'].values / 1e9
+    M['price_at_migration'] = (M['sol_amount'].values / 1e9) / (M['mint_amount'].values / 1e6 + 1e-9)
+else:
+    M['sol_migration_ratio'] = 0.0
+    M['price_at_migration'] = 0.0
 
-print(f"Launch metadata processed for {len(M):,} unique tokens.")
+print(f"Creation feature table assembled: {M.shape}")
 """))
 
-# Cell 4: High-Frequency Microstructure Feature Extraction
-cells.append(nbf.v4.new_markdown_cell("""## 3. High-Frequency Microstructure Feature Extraction
-
-Reading the high-frequency transaction tapes (bonding curve swaps and the first 60 seconds of AMM trading):
-- **Direction Correction**: Inverts `'B'` when `base_token == WSOL`
-- **Window Slices**: Volume acceleration and buy pressure delta between $W_2 \\in [30, 60\\text{s}]$ and $W_0 \\in [0, 15\\text{s}]$
-- **MEV Sniper Detection**: Flagging `signing_wallet != fee_payer`
-- **Creator First-Minute Participation**: Tracks creator buy/sell volume
-- **Reserve Depth Dynamics**: Pool liquidity depth return in SOL
-"""))
+# Cell 3: High-Frequency Microstructure & Tape Dynamics
+cells.append(nbf.v4.new_markdown_cell("""## 2. High-Frequency Microstructure & Order Flow Acceleration"""))
 
 cells.append(nbf.v4.new_code_cell("""CURVE_COLS = ['failed', 'mint', 'ts_rel', 'slot', 'tx_idx', 'direction', 'sol', 'new_price', 'wallet', 'provided_gas_fee']
-AMM_COLS   = [
+AMM_COLS = [
     'mint', 'ts_rel', 'slot', 'tx_idx', 'direction', 'base_token', 'sol', 'new_price', 
     'signing_wallet', 'fee_payer', 'provided_gas_fee', 'coin_creator',
     'pool_base_token_reserves_after', 'pool_quote_token_reserves_after'
 ]
 
-def extract_tape_features(c_df, a_df):
+def compute_gini(arr):
+    vals = np.sort(arr[arr > 0])
+    n = len(vals)
+    if n <= 1:
+        return 0.0
+    index = np.arange(1, n + 1)
+    return float((np.sum((2 * index - n - 1) * vals)) / (n * np.sum(vals)))
+
+def tape_features(c_df, a_df):
     if 'signing_wallet' in a_df.columns:
         a_df = a_df.rename(columns={'signing_wallet': 'wallet'})
         
@@ -254,6 +262,54 @@ def extract_tape_features(c_df, a_df):
     ws_norm = ws / ws.groupby('mint').transform('sum').replace(0, np.nan)
     F['amm_hhi'] = (ws_norm ** 2).groupby('mint').sum()
     
+    # Gini coefficient of buy volumes
+    ginis = ws.groupby('mint').apply(lambda s: compute_gini(s.values)).reindex(F.index).fillna(0.0)
+    F['amm_gini'] = ginis
+    
+    # Wash trading detection
+    F['unique_buyers_ratio'] = F['amm_uw'] / F['amm_n'].replace(0, np.nan)
+    max_tx_w = a_df.groupby(['mint', 'wallet']).size().groupby('mint').max()
+    F['wallet_max_tx_share'] = (max_tx_w / F['amm_n'].replace(0, np.nan)).reindex(F.index).fillna(0.0)
+    
+    # Launch block early slot sniping (slots 0 to 2)
+    if 'slot' in a_df.columns:
+        min_slot = a_df.groupby('mint')['slot'].min()
+        a_df['slot_offset'] = a_df['slot'] - a_df['mint'].map(min_slot)
+        early_snipes = a_df[a_df.slot_offset <= 2]
+        
+        early_sol = early_snipes.groupby('mint')['sol'].sum().reindex(F.index).fillna(0.0)
+        early_buys = early_snipes.groupby('mint')['buy_sol'].sum().reindex(F.index).fillna(0.0)
+        early_tx = early_snipes.groupby('mint').size().reindex(F.index).fillna(0)
+        
+        F['slot_snipe_vol_share'] = early_sol / (F['amm_sol'] + 1e-4)
+        F['slot_snipe_buy_share'] = early_buys / (early_sol + 1e-4)
+        F['slot_snipe_tx_count'] = early_tx
+    else:
+        F['slot_snipe_vol_share'] = 0.0
+        F['slot_snipe_buy_share'] = 0.0
+        F['slot_snipe_tx_count'] = 0
+        
+    # Liquidity curve velocity & acceleration (W0: 0-20s, W1: 20-40s, W2: 40-60s)
+    v0 = a_df[a_df.ts_rel < 20].groupby('mint')['sol'].sum().reindex(F.index).fillna(0.0)
+    v1 = a_df[(a_df.ts_rel >= 20) & (a_df.ts_rel < 40)].groupby('mint')['sol'].sum().reindex(F.index).fillna(0.0)
+    v2 = a_df[a_df.ts_rel >= 40].groupby('mint')['sol'].sum().reindex(F.index).fillna(0.0)
+    
+    F['d2v_dt2'] = v2 - 2.0 * v1 + v0
+    F['rel_flow_accel'] = (v2 - 2.0 * v1 + v0) / (v0 + v1 + v2 + 1e-4)
+    
+    tot_buy_sol = a_df.groupby('mint')['buy_sol'].sum().reindex(F.index).fillna(0.0)
+    tot_sell_sol = a_df.groupby('mint')['sell_sol'].sum().reindex(F.index).fillna(0.0)
+    F['buysell_sol_ratio'] = tot_buy_sol / (tot_sell_sol + 1e-4)
+    F['net_sol_flow'] = tot_buy_sol - tot_sell_sol
+    
+    buy_tx = a_df[a_df.is_buy == 1].groupby('mint').size().reindex(F.index).fillna(0)
+    sell_tx = a_df[a_df.is_buy == 0].groupby('mint').size().reindex(F.index).fillna(0)
+    F['buysell_tx_ratio'] = buy_tx / (sell_tx + 1e-4)
+    
+    early_dump = a_df[(a_df.ts_rel <= 15) & (a_df.is_buy == 0)].groupby('mint')['sol'].sum().reindex(F.index).fillna(0.0)
+    F['early_dump_sol'] = early_dump
+    F['early_dump_share'] = early_dump / (tot_sell_sol + 1e-4)
+
     w0 = a_df[a_df.ts_rel < 15]
     w2 = a_df[a_df.ts_rel >= 30]
     w0_sol = w0.groupby('mint')['sol'].sum().reindex(F.index).fillna(0.0)
@@ -348,57 +404,56 @@ else:
     DAYS = [(os.path.basename(f)[4:14], f, f.replace('pumpfun_all_swaps', 'pumpswap_all_swaps'))
             for f in sorted(glob.glob(f'{DATA}/day_*_pumpfun_all_swaps.parquet'))]
 
-print(f"Discovered {len(DAYS)} daily transaction tape partitions.")
-
-tape_frames, edges_list = [], []
-t0_tape = time.time()
+frames = []
+edges = []
+t0 = time.time()
 
 if len(DAYS) > 0:
     for i, (day, cp, ap) in enumerate(DAYS, 1):
         if not os.path.exists(cp) or not os.path.exists(ap):
             continue
-        c = pd.read_parquet(cp, columns=[c for c in CURVE_COLS if c in pd.read_parquet(cp).columns])
-        a = pd.read_parquet(ap, columns=[c for c in AMM_COLS if c in pd.read_parquet(ap).columns]).rename(columns={'signing_wallet': 'wallet'})
+        c = pd.read_parquet(cp, columns=[col for col in CURVE_COLS if col in pd.read_parquet(cp).columns[:5].tolist() or True])
+        a = pd.read_parquet(ap)
+        frames.append(tape_features(c, a))
         
-        tape_frames.append(extract_tape_features(c, a))
-        
-        a_buys = a[(a.ts_rel <= 60)]
-        edges_list.append(a_buys.groupby(['mint', 'wallet'], as_index=False)['sol'].sum())
-        
+        a_buys = a[a.direction.astype(str).str.upper().str.startswith('B') & (a.ts_rel <= 60)]
+        w_col = 'signing_wallet' if 'signing_wallet' in a_buys.columns else 'wallet'
+        edges.append(a_buys.groupby(['mint', w_col], as_index=False)['sol'].sum().rename(columns={w_col: 'wallet'}))
         del c, a; gc.collect()
         if i % 10 == 0 or i == len(DAYS):
-            print(f"  Processed {i}/{len(DAYS)} tapes ({time.time() - t0_tape:.0f}s)")
+            print(f"  Processed tape day {i}/{len(DAYS)} ({time.time()-t0:.1f}s)")
             
-    TAPE_DF = pd.concat(tape_frames, ignore_index=True).drop_duplicates('mint')
-    AMM_EDGES = pd.concat(edges_list, ignore_index=True)
+    TAPE_DF = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    AMM_EDGES = pd.concat(edges, ignore_index=True) if edges else pd.DataFrame()
 else:
     c_sample = f'{DATA}/00_sample_pumpfun_swaps.csv'
     a_sample = f'{DATA}/01_sample_pumpswap_swaps.csv'
     if os.path.exists(c_sample) and os.path.exists(a_sample):
         c = pd.read_csv(c_sample)
-        a = pd.read_csv(a_sample).rename(columns={'signing_wallet': 'wallet'})
-        TAPE_DF = extract_tape_features(c, a)
-        a_buys = a[(a.ts_rel <= 60)]
+        a = pd.read_csv(a_sample)
+        TAPE_DF = tape_features(c, a)
+        a_buys = a[a.ts_rel <= 60].rename(columns={'signing_wallet': 'wallet'})
         AMM_EDGES = a_buys.groupby(['mint', 'wallet'], as_index=False)['sol'].sum()
     else:
-        TAPE_DF = pd.DataFrame({'mint': []})
+        TAPE_DF = pd.DataFrame()
         AMM_EDGES = pd.DataFrame()
+
+print(f"Tape ingestion finished. Shape: {TAPE_DF.shape}")
 """))
 
-# Cell 5: Causal Reputation with Recency Decay
-cells.append(nbf.v4.new_markdown_cell("""## 4. Causal Empirical Bayes Participant & Deployer Reputation (Recency Weighted)
-
-Enforcing a strict 1-hour resolution embargo ($mt_j \\le mt_i - 3600$) with a 5-day exponential decay half-life to capture active participant hot streaks without lookahead leakage.
-"""))
+# Cell 4: Causal Participant & Deployer History
+cells.append(nbf.v4.new_markdown_cell("""## 3. Causal Creator History & Participant Reputation Engine"""))
 
 cells.append(nbf.v4.new_code_cell("""REPUTATION_COLS = [
     'w_known', 'w_hit_max', 'w_hit_mean', 'w_hit_top3', 
     'w_elite_n', 'w_elite_share', 'w_eb_score',
     'w_decay_eb_score', 'w_decay_hits',
-    'c_known', 'c_hit_rate', 'c_decay_rate'
+    'c_known', 'c_hit_rate', 'c_decay_rate',
+    'c_launches', 'c_median_peak', 'c_max_peak',
+    'c_hit_3x', 'c_hit_5x', 'c_last_peak', 'c_time_since_last'
 ]
 
-def build_causal_reputation(tokens_df, amm_edges_df, creator_map=None, target_k=5.0, win=WIN, tau_decay=TAU_DECAY):
+def build_causal_reputation(tokens_df, amm_edges_df, creator_map=None, target_k=5.0, win=3600, tau_decay=5*86400):
     tok = tokens_df[['mint', 'mt']].copy()
     tok['max_x'] = tokens_df['max_x'].values if 'max_x' in tokens_df.columns else np.nan
     tok = tok.sort_values('mt', kind='stable').reset_index(drop=True)
@@ -420,13 +475,21 @@ def build_causal_reputation(tokens_df, amm_edges_df, creator_map=None, target_k=
     decay_appear = np.zeros(nW, dtype=np.float32)
     decay_hit = np.zeros(nW, dtype=np.float32)
     
-    creator_appear, creator_hit = {}, {}
-    creator_decay_ap, creator_decay_ht = {}, {}
+    creator_appear = {}
+    creator_hit = {}
+    creator_decay_ap = {}
+    creator_decay_ht = {}
+    creator_past_peaks = {}
+    creator_last_ts = {}
     
-    mts, mxs, mints = tok.mt.values, tok.max_x.values, tok.mint.values
+    mts = tok.mt.values
+    mxs = tok.max_x.values
+    mints = tok.mint.values
+    
     out = np.zeros((len(tok), len(REPUTATION_COLS)), dtype=float)
     j = 0
-    alpha_prior, beta_prior = 1.0, 15.0
+    alpha_prior = 1.0
+    beta_prior = 15.0
     
     for i in range(len(tok)):
         cur_t = mts[i]
@@ -444,14 +507,20 @@ def build_causal_reputation(tokens_df, amm_edges_df, creator_map=None, target_k=
                         np.add.at(decay_hit, wids, decay_factor)
                         
                 if creator_map is not None:
-                    cw = creator_map.get(mints[j])
-                    if cw and str(cw) != 'nan' and len(str(cw)) > 0:
+                    c_wallet = creator_map.get(mints[j])
+                    if c_wallet and str(c_wallet) != 'nan' and len(str(c_wallet)) > 0:
                         decay_factor = np.exp(-(cur_t - t_res) / max(tau_decay, 1.0))
-                        creator_appear[cw] = creator_appear.get(cw, 0) + 1
-                        creator_decay_ap[cw] = creator_decay_ap.get(cw, 0.0) + decay_factor
+                        creator_appear[c_wallet] = creator_appear.get(c_wallet, 0) + 1
+                        creator_decay_ap[c_wallet] = creator_decay_ap.get(c_wallet, 0.0) + decay_factor
+                        
+                        if c_wallet not in creator_past_peaks:
+                            creator_past_peaks[c_wallet] = []
+                        creator_past_peaks[c_wallet].append(float(mxs[j]))
+                        creator_last_ts[c_wallet] = t_res
+                        
                         if mxs[j] >= target_k:
-                            creator_hit[cw] = creator_hit.get(cw, 0) + 1
-                            creator_decay_ht[cw] = creator_decay_ht.get(cw, 0.0) + decay_factor
+                            creator_hit[c_wallet] = creator_hit.get(c_wallet, 0) + 1
+                            creator_decay_ht[c_wallet] = creator_decay_ht.get(c_wallet, 0.0) + decay_factor
             j += 1
             
         w = by_mint.get(mints[i])
@@ -464,11 +533,9 @@ def build_causal_reputation(tokens_df, amm_edges_df, creator_map=None, target_k=
                 ap_k = ap[known]
                 rate = ht / ap_k
                 eb_rates = (ht + alpha_prior) / (ap_k + alpha_prior + beta_prior)
-                
                 d_ap = decay_appear[wids][known]
                 d_ht = decay_hit[wids][known]
                 decay_eb = (d_ht + alpha_prior) / (d_ap + alpha_prior + beta_prior)
-                
                 elite = (ap >= 5) & (hit[wids] >= 1)
                 
                 out[i, 0] = int(known.sum())
@@ -482,14 +549,25 @@ def build_causal_reputation(tokens_df, amm_edges_df, creator_map=None, target_k=
                 out[i, 8] = float(d_ht.sum())
                 
         if creator_map is not None:
-            cw = creator_map.get(mints[i])
-            if cw and str(cw) != 'nan':
-                c_ap = creator_appear.get(cw, 0)
+            c_wallet = creator_map.get(mints[i])
+            if c_wallet and str(c_wallet) != 'nan':
+                c_ap = creator_appear.get(c_wallet, 0)
                 if c_ap > 0:
+                    c_ht = creator_hit.get(c_wallet, 0)
                     out[i, 9] = 1.0
-                    out[i, 10] = float(creator_hit.get(cw, 0) / c_ap)
-                    out[i, 11] = float((creator_decay_ht.get(cw, 0.0) + alpha_prior) / 
-                                       (creator_decay_ap.get(cw, 0.0) + alpha_prior + beta_prior))
+                    out[i, 10] = float(c_ht / c_ap)
+                    out[i, 11] = float((creator_decay_ht.get(c_wallet, 0.0) + alpha_prior) / 
+                                       (creator_decay_ap.get(c_wallet, 0.0) + alpha_prior + beta_prior))
+                    
+                if c_wallet in creator_past_peaks:
+                    peaks = creator_past_peaks[c_wallet]
+                    out[i, 12] = len(peaks)
+                    out[i, 13] = float(np.median(peaks))
+                    out[i, 14] = float(np.max(peaks))
+                    out[i, 15] = float(np.mean([p >= 3.0 for p in peaks]))
+                    out[i, 16] = float(np.mean([p >= 5.0 for p in peaks]))
+                    out[i, 17] = float(peaks[-1])
+                    out[i, 18] = float(cur_t - creator_last_ts.get(c_wallet, cur_t))
                     
     rep_df = pd.DataFrame(out, columns=REPUTATION_COLS)
     rep_df['mint'] = mints
@@ -505,7 +583,7 @@ REP_DF = build_causal_reputation(tok_universe, AMM_EDGES, creator_map=creator_di
 print(f"Causal reputation computed across {len(REP_DF):,} tokens.")
 """))
 
-# Cell 6: Feature Assembly & Merging
+# Cell 5: Assembly
 cells.append(nbf.v4.new_code_cell("""def assemble(df):
     d = df.merge(M, on='mint', how='left')
     if len(TAPE_DF) > 0 and 'mint' in TAPE_DF.columns:
@@ -522,51 +600,84 @@ FE = [c for c in TR.columns if c not in exclude and np.issubdtype(TR[c].dtype, n
 print(f"Final feature space: {len(FE)} features.")
 """))
 
-# Cell 7: Multi-Level Expected Value Modeling Engine
-cells.append(nbf.v4.new_markdown_cell("""## 5. Multi-Level Expected Value Prediction Engine
-
-Architecture:
-- Models $y_k = \\mathbb{I}(\\text{max\\_x} \\ge k)$ across $\\text{LEVELS} = (3, 4, 5, 7, 10, 15)$.
-- Enforces monotonic probabilities: $P(\\ge 15) \\le P(\\ge 10) \\le \\dots \\le P(\\ge 3)$.
-- Calculates empirical held payoffs $\\text{held\\_miss}(k) = \\mathbb{E}[\\max(\\text{final\\_x} - 1.3, -1.0) \\mid \\text{max\\_x} < k]$.
-- Evaluates Expected Value: $\\mathbb{E}[\\text{PnL}(k)] = p_k \\cdot (k - 1.30) + (1 - p_k) \\cdot \\text{held\\_miss}(k)$.
-- Assigns $\\arg\\max_k \\mathbb{E}[\\text{PnL}(k)]$ subject to a risk-adjusted daily Sharpe margin hurdle.
-"""))
+# Cell 6: Decoupled Two-Stage Model
+cells.append(nbf.v4.new_markdown_cell("""## 4. Decoupled Two-Stage Gatekeeper & Utility Maximizer Engine"""))
 
 cells.append(nbf.v4.new_code_cell("""LGB_PARAMS = dict(
     n_estimators=300, learning_rate=0.04, num_leaves=31, min_child_samples=40,
     subsample=0.80, subsample_freq=1, colsample_bytree=0.70, verbose=-1, n_jobs=-1
 )
 
-class MultiLevelExpectedValueEngine:
+class TwoStageDecisionEngine:
     def __init__(self, feature_cols, levels=LEVELS, seeds=SEEDS, lgb_params=LGB_PARAMS, cost=COST):
         self.feature_cols = feature_cols
         self.levels = np.array(levels, dtype=float)
         self.seeds = seeds
         self.lgb_params = lgb_params
         self.cost = cost
+        self.calibrator = None
+        self.gatekeeper_models = []
+        self.level_models = {lv: [] for lv in self.levels}
 
-    def fit_predict_levels(self, train_df, test_df):
+    def fit_gatekeeper(self, train_df):
         X_tr = train_df[self.feature_cols].astype(float).fillna(0).values
-        X_te = test_df[self.feature_cols].astype(float).fillna(0).values
-        mxs_tr = train_df['max_x'].values
-        probs = np.zeros((len(test_df), len(self.levels)), dtype=float)
+        y_tr_3x = (train_df['max_x'].values >= 3.0).astype(int)
         
-        for j, lv in enumerate(self.levels):
-            y_lv = (mxs_tr >= lv).astype(int)
-            if y_lv.sum() < 20:
-                probs[:, j] = float(y_lv.mean())
-                continue
-            p_seed = np.mean([
-                lgb.LGBMClassifier(random_state=s, **self.lgb_params).fit(X_tr, y_lv).predict_proba(X_te)[:, 1]
+        self.gatekeeper_models = [
+            lgb.LGBMClassifier(random_state=s, **self.lgb_params)
+            .fit(X_tr, y_tr_3x)
+            for s in self.seeds
+        ]
+        
+        d_trn = sorted(train_df.day.unique())
+        cal_days = d_trn[-HOLD_DAYS:]
+        trn_cal = train_df[train_df.day.isin(cal_days)].reset_index(drop=True)
+        trn_old = train_df[(train_df.day < cal_days[0]) & (train_df.mt <= trn_cal.mt.min() - WIN - EMBARGO)].reset_index(drop=True)
+        
+        if len(trn_old) >= 500:
+            X_old = trn_old[self.feature_cols].astype(float).fillna(0).values
+            y_old = (trn_old['max_x'].values >= 3.0).astype(int)
+            X_cal = trn_cal[self.feature_cols].astype(float).fillna(0).values
+            y_cal = (trn_cal['max_x'].values >= 3.0).astype(int)
+            
+            p_cal_raw = np.mean([
+                lgb.LGBMClassifier(random_state=s, **self.lgb_params)
+                .fit(X_old, y_old)
+                .predict_proba(X_cal)[:, 1]
                 for s in self.seeds
             ], axis=0)
-            probs[:, j] = p_seed
             
-        probs_monotonic = np.minimum.accumulate(probs, axis=1)
-        return probs_monotonic
+            self.calibrator = LogisticRegression()
+            self.calibrator.fit(p_cal_raw.reshape(-1, 1), y_cal)
+        else:
+            self.calibrator = None
 
-    def compute_held_payoffs(self, train_df):
+    def predict_gatekeeper(self, test_df):
+        X_te = test_df[self.feature_cols].astype(float).fillna(0).values
+        p_raw = np.mean([m.predict_proba(X_te)[:, 1] for m in self.gatekeeper_models], axis=0)
+        if self.calibrator is not None:
+            return self.calibrator.predict_proba(p_raw.reshape(-1, 1))[:, 1]
+        return p_raw
+
+    def fit_levels(self, train_df):
+        X_tr = train_df[self.feature_cols].astype(float).fillna(0).values
+        mxs_tr = train_df['max_x'].values
+        for lv in self.levels:
+            y_lv = (mxs_tr >= lv).astype(int)
+            self.level_models[lv] = [
+                lgb.LGBMClassifier(random_state=s, **self.lgb_params)
+                .fit(X_tr, y_lv)
+                for s in self.seeds
+            ]
+
+    def predict_levels(self, test_df):
+        X_te = test_df[self.feature_cols].astype(float).fillna(0).values
+        probs = np.zeros((len(test_df), len(self.levels)), dtype=float)
+        for j, lv in enumerate(self.levels):
+            probs[:, j] = np.mean([m.predict_proba(X_te)[:, 1] for m in self.level_models[lv]], axis=0)
+        return np.minimum.accumulate(probs, axis=1)
+
+    def compute_miss_payoffs(self, train_df):
         mxs = train_df['max_x'].values
         fxs = train_df['final_x'].values if 'final_x' in train_df.columns else train_df['finalx'].values
         held = np.maximum(fxs - 1.0 - self.cost, -1.0)
@@ -576,118 +687,49 @@ class MultiLevelExpectedValueEngine:
             held_by_level.append(float(held[miss].mean()) if miss.any() else -0.95)
         return np.array(held_by_level, dtype=float)
 
-    def calculate_expected_values(self, probs, held_by_level):
-        levels_row = self.levels[None, :]
-        win_pnl = levels_row - 1.0 - self.cost
+    def calculate_expected_values(self, probs_monotonic, held_by_level):
+        win_pnl = self.levels[None, :] - 1.0 - self.cost
         held_row = held_by_level[None, :]
-        return probs * win_pnl + (1.0 - probs) * held_row
+        return probs_monotonic * win_pnl + (1.0 - probs_monotonic) * held_row
 
-    def decide(self, ev_matrix, min_ev_margin=0.20, fallback_q=1.0):
-        best_idx = np.argmax(ev_matrix, axis=1)
-        best_ev = ev_matrix[np.arange(len(ev_matrix)), best_idx]
-        best_level = self.levels[best_idx]
+    def decide(self, p_gatekeeper, ev_matrix, top_n_daily=2, min_prob_hurdle=0.20, min_ev_margin=0.0):
+        n = len(p_gatekeeper)
+        final_tp = np.zeros(n, dtype=float)
+        best_lv_idx = np.argmax(ev_matrix, axis=1)
+        best_ev = ev_matrix[np.arange(n), best_lv_idx]
+        best_tp = self.levels[best_lv_idx]
         
-        tp = np.where(best_ev >= min_ev_margin, best_level, 0.0)
-        if (tp > 0).sum() == 0 and fallback_q > 0:
-            top_k = max(1, int(len(ev_matrix) * fallback_q / 100.0))
-            tp = np.zeros(len(ev_matrix), dtype=float)
-            if best_ev.max() > best_ev.min():
-                order = np.argsort(-best_ev)
-                top_indices = order[:top_k]
-                tp[top_indices] = best_level[top_indices]
-        return tp, best_ev
-
-def optimize_ev_margin(model, train_df, margin_grid=(0.05, 0.10, 0.20, 0.30, 0.50, 0.75, 1.0), hold_days=HOLD_DAYS):
-    d = sorted(train_df.day.unique())
-    if len(d) <= hold_days:
-        hold_days = max(1, len(d) // 3)
-    cal = train_df[train_df.day >= d[-hold_days]].reset_index(drop=True)
-    old = train_df[(train_df.day < d[-hold_days]) & (train_df.mt <= cal.mt.min() - WIN - EMBARGO)].reset_index(drop=True)
-    if len(old) < 500:
-        old = train_df[train_df.day < d[-hold_days]].reset_index(drop=True)
+        valid_mask = (p_gatekeeper >= min_prob_hurdle) & (best_ev >= min_ev_margin)
+        valid_indices = np.where(valid_mask)[0]
         
-    probs = model.fit_predict_levels(old, cal)
-    held = model.compute_held_payoffs(old)
-    ev = model.calculate_expected_values(probs, held)
-    
-    best_margin = 0.20
-    best_score = -9999.0
-    for margin in margin_grid:
-        tp, _ = model.decide(ev, min_ev_margin=margin, fallback_q=0.0)
-        hit = (cal.max_x.values >= tp) & (tp > 0)
-        held_loss = np.maximum(cal.final_x.values - 1.0 - COST, -1.0)
-        pnl_vals = np.where(tp <= 0, 0.0, np.where(hit, tp - 1.0 - COST, held_loss))
-        daily = pd.Series(pnl_vals).groupby(cal.day).sum()
-        if (tp > 0).sum() < 3:
-            continue
-        robust_sharpe = float(daily.mean() - 0.25 * daily.std(ddof=0))
-        if robust_sharpe > best_score:
-            best_score = robust_sharpe
-            best_margin = margin
-    return best_margin
+        if len(valid_indices) > 0 and top_n_daily > 0:
+            scores = p_gatekeeper[valid_indices]
+            order = np.argsort(-scores)
+            selected = valid_indices[order[:top_n_daily]]
+            final_tp[selected] = best_tp[selected]
+        elif (final_tp > 0).sum() == 0 and top_n_daily > 0:
+            order = np.argsort(-best_ev)
+            top_cand = [idx for idx in order[:top_n_daily] if best_ev[idx] >= -0.20]
+            if top_cand:
+                final_tp[top_cand] = best_tp[top_cand]
+        return final_tp, best_ev
 """))
 
-# Cell 8: Embargoed Walk-Forward Backtest
-cells.append(nbf.v4.new_markdown_cell("""## 6. Embargoed Walk-Forward Backtesting
+# Cell 7: Full Production Fit & Submission
+cells.append(nbf.v4.new_markdown_cell("""## 5. Full Production Fit & Validated Submission Generation"""))
 
-Evaluating the multi-level policy across out-of-fold days under strict 2-hour embargo buffers.
-"""))
+cells.append(nbf.v4.new_code_cell("""print("Training production Two-Stage Decoupled Engine on full historical universe...")
+engine = TwoStageDecisionEngine(feature_cols=FE)
+engine.fit_gatekeeper(TR)
+engine.fit_levels(TR)
 
-cells.append(nbf.v4.new_code_cell("""days = sorted(TR.day.unique())
-eval_days = days[max(5, len(days) - 10):]
-ev_engine = MultiLevelExpectedValueEngine(feature_cols=FE)
+print("Generating calibrated Stage 1 probabilities & Stage 2 expected values...")
+test_p_gate = engine.predict_gatekeeper(TE)
+test_p_levels = engine.predict_levels(TE)
+miss_payoffs = engine.compute_miss_payoffs(TR)
+test_ev = engine.calculate_expected_values(test_p_levels, miss_payoffs)
 
-wf_rows = []
-print(f"Running walk-forward evaluation across {len(eval_days)} days...")
-
-for day in eval_days:
-    val = TR[TR.day == day].reset_index(drop=True)
-    trn = TR[(TR.day < day) & (TR.mt <= val.mt.min() - WIN - EMBARGO)].reset_index(drop=True)
-    if len(trn) < 1000 or len(val) < 20:
-        continue
-        
-    probs = ev_engine.fit_predict_levels(trn, val)
-    held = ev_engine.compute_held_payoffs(trn)
-    ev = ev_engine.calculate_expected_values(probs, held)
-    
-    for margin in [0.10, 0.20, 0.30, 0.50]:
-        tp_alloc, _ = ev_engine.decide(ev, min_ev_margin=margin, fallback_q=1.0)
-        pnl_val = float(pnl(tp_alloc, val.max_x.values, val.final_x.values).sum())
-        n_buy = int((tp_alloc > 0).sum())
-        hits = int(((val.max_x.values >= tp_alloc) & (tp_alloc > 0)).sum())
-        wf_rows.append(dict(day=day, margin=margin, taken=n_buy, hits=hits, pnl=pnl_val))
-
-WF_DF = pd.DataFrame(wf_rows)
-print("\\n" + "=" * 75)
-print("EMBARGOED MULTI-LEVEL WALK-FORWARD SUMMARY")
-print("=" * 75)
-for m, g in WF_DF.groupby('margin'):
-    tot_trades = g.taken.sum()
-    tot_hits = g.hits.sum()
-    tot_pnl = g.pnl.sum()
-    prec = 100.0 * tot_hits / max(tot_trades, 1)
-    win_days = (g.pnl > 0).sum()
-    print(f"Margin {m:>4.2f} | Avg Trades/Day: {g.taken.mean():4.1f} | Precision: {prec:5.1f}% | Total PnL: {tot_pnl:+7.2f} SOL | Profitable Days: {win_days}/{len(g)}")
-print("=" * 75)
-"""))
-
-# Cell 9: Production Fit & Submission Generation
-cells.append(nbf.v4.new_markdown_cell("""## 7. Full Production Retraining & Dynamic Take-Profit Allocation
-
-Retraining the multi-level expected value engine on the entire historical dataset, calibrating the optimal EV margin, and generating the verified `submission.csv`.
-"""))
-
-cells.append(nbf.v4.new_code_cell("""print("Fitting production multi-level engine on full historical dataset...")
-production_engine = MultiLevelExpectedValueEngine(feature_cols=FE)
-
-optimal_margin = optimize_ev_margin(production_engine, TR)
-print(f"Optimal risk-adjusted EV margin: {optimal_margin:.3f}")
-
-test_probs = production_engine.fit_predict_levels(TR, TE)
-held_payoffs = production_engine.compute_held_payoffs(TR)
-test_ev = production_engine.calculate_expected_values(test_probs, held_payoffs)
-
-test_tp, best_ev = production_engine.decide(test_ev, min_ev_margin=optimal_margin, fallback_q=1.0)
+test_tp, best_ev = engine.decide(test_p_gate, test_ev, top_n_daily=2, min_prob_hurdle=0.20, min_ev_margin=0.0)
 
 sub = pd.DataFrame({'mint': TE['mint'], 'tp': test_tp})
 
@@ -717,7 +759,8 @@ print(f"Tokens allocated long entries: {num_buys} ({num_buys / len(sub) * 100:.2
 print(f"Tokens skipped at zero cost (tp = 0): {len(sub) - num_buys}")
 print("Take-profit level allocation counts:")
 print(sub[sub.tp > 0]['tp'].value_counts().sort_index())
-display(sub[sub.tp > 0].head(10))
+if num_buys > 0:
+    display(sub[sub.tp > 0].head(10))
 """))
 
 nb['cells'] = cells

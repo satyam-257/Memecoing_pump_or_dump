@@ -6,7 +6,8 @@ import pandas as pd
 
 def extract_creation_features(data_dir):
     """
-    Extracts structured features from pumpfun_token_creation.csv and pfamm_migrations.csv.
+    Extracts structured features from pumpfun_token_creation.csv and pfamm_migrations.csv,
+    including deployer balances, opcode heuristics, and metadata platform indicators.
     """
     cre_path = os.path.join(data_dir, 'pumpfun_token_creation.csv')
     if not os.path.exists(cre_path):
@@ -18,12 +19,21 @@ def extract_creation_features(data_dir):
     name = cre.name.fillna('').astype(str)
     sym = cre.symbol.fillna('').astype(str)
     bs = cre.bundle_structure.fillna('').astype(str)
+    url = cre.url.fillna('').astype(str)
     
     df = pd.DataFrame({'mint': cre.mint, 'creator': cre.creator.fillna('').astype(str)})
     df['name_len'] = name.str.len()
     df['symbol_len'] = sym.str.len()
     df['name_upper'] = name.apply(lambda s: sum(ch.isupper() for ch in s) / max(len(s), 1))
     df['name_eq_symbol'] = (name.str.lower().str[:4] == sym.str.lower().str[:4]).astype(np.int8)
+    df['symbol_is_short'] = (df['symbol_len'] <= 4).astype(np.int8)
+    
+    # Deployer metadata platforms & custom URL domains
+    is_ipfs = url.str.contains(r'ipfs\.io|pinata', regex=True).astype(np.int8)
+    is_bot = url.str.contains(r'j7tracker|vortexdeployer|rapidlaunch|uxento|sdfgsdfsdf|usepaid|agencypad', regex=True).astype(np.int8)
+    df['is_ipfs_url'] = is_ipfs
+    df['is_deployer_bot_url'] = is_bot
+    df['has_custom_domain'] = ((url != '') & (is_ipfs == 0) & (is_bot == 0)).astype(np.int8)
     
     # Bundle structure analysis
     df['bs_ops'] = bs.str.split().str.len().fillna(0)
@@ -44,6 +54,11 @@ def extract_creation_features(data_dir):
         if col in cre.columns:
             df[col] = pd.to_numeric(cre[col], errors='coerce').fillna(0).values
             
+    # Deployer balance transformation & burner wallet indicators
+    df['dev_balance_log'] = np.log10(np.maximum(df['dev_balance'].values, 0) + 1.0)
+    df['is_micro_dev_balance'] = (df['dev_balance'].values < 0.05 * 1e9).astype(np.int8)
+    df['bundle_buy_density'] = df['bundled_buys_count'].values / np.maximum(df['bundle_size'].values, 1)
+    
     # Token 2022 flag
     if 'token_program' in cre.columns:
         df['token2022'] = (~cre.token_program.fillna('').astype(str).str.startswith('Tokenkeg')).astype(np.int8)
@@ -64,4 +79,10 @@ def extract_creation_features(data_dir):
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0).values
                 
+        df['sol_migration_ratio'] = df['sol_amount'].values / 1e9
+        df['price_at_migration'] = (df['sol_amount'].values / 1e9) / (df['mint_amount'].values / 1e6 + 1e-9)
+    else:
+        df['sol_migration_ratio'] = 0.0
+        df['price_at_migration'] = 0.0
+        
     return df

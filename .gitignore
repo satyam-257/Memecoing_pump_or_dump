@@ -29,6 +29,7 @@ Desktop.ini
 # Kaggle credentials & local output caches
 kaggle.json
 kernel_output/
+catboost_info/
 *.log
 
 # Data and large submission outputs

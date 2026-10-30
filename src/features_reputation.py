@@ -7,13 +7,18 @@ REPUTATION_COLS = [
     'w_known', 'w_hit_max', 'w_hit_mean', 'w_hit_top3', 
     'w_elite_n', 'w_elite_share', 'w_eb_score',
     'w_decay_eb_score', 'w_decay_hits',
-    'c_known', 'c_hit_rate', 'c_decay_rate'
+    'c_known', 'c_hit_rate', 'c_decay_rate',
+    'c_launches', 'c_median_peak', 'c_max_peak',
+    'c_hit_3x', 'c_hit_5x', 'c_last_peak', 'c_time_since_last'
 ]
 
 def build_causal_reputation(tokens_df, amm_edges_df, creator_map=None, target_k=TARGET_K, win=WIN, tau_decay=TAU_DECAY):
     """
-    Computes participant reputation under strict causal ordering with exponential recency decay.
-    Only tokens resolved at least WIN (3600s) seconds before migration are committed.
+    Computes participant and deployer reputation under strict causal ordering with:
+    - 1-hour resolution embargo (mt_j <= mt_i - 3600)
+    - Exponential recency decay
+    - Empirical Bayes shrinkage
+    - Deployer launch history (prior launches, median peak, max peak, 3x/5x hit rates, last peak)
     """
     tok = tokens_df[['mint', 'mt']].copy()
     if 'max_x' in tokens_df.columns:
@@ -42,13 +47,13 @@ def build_causal_reputation(tokens_df, amm_edges_df, creator_map=None, target_k=
     # Recency decayed counts
     decay_appear = np.zeros(nW, dtype=np.float32)
     decay_hit = np.zeros(nW, dtype=np.float32)
-    last_update_ts = np.zeros(nW, dtype=np.int64)
     
     # Creator stats tracking
     creator_appear = {}
     creator_hit = {}
     creator_decay_ap = {}
     creator_decay_ht = {}
+    creator_past_peaks = {}
     creator_last_ts = {}
     
     mts = tok.mt.values
@@ -89,6 +94,12 @@ def build_causal_reputation(tokens_df, amm_edges_df, creator_map=None, target_k=
                         decay_factor = np.exp(-(cur_t - t_res) / max(tau_decay, 1.0))
                         creator_appear[c_wallet] = creator_appear.get(c_wallet, 0) + 1
                         creator_decay_ap[c_wallet] = creator_decay_ap.get(c_wallet, 0.0) + decay_factor
+                        
+                        if c_wallet not in creator_past_peaks:
+                            creator_past_peaks[c_wallet] = []
+                        creator_past_peaks[c_wallet].append(float(mxs[j]))
+                        creator_last_ts[c_wallet] = t_res
+                        
                         if mxs[j] >= target_k:
                             creator_hit[c_wallet] = creator_hit.get(c_wallet, 0) + 1
                             creator_decay_ht[c_wallet] = creator_decay_ht.get(c_wallet, 0.0) + decay_factor
@@ -137,6 +148,16 @@ def build_causal_reputation(tokens_df, amm_edges_df, creator_map=None, target_k=
                     out[i, 10] = float(c_ht / c_ap)
                     out[i, 11] = float((creator_decay_ht.get(c_wallet, 0.0) + alpha_prior) / 
                                        (creator_decay_ap.get(c_wallet, 0.0) + alpha_prior + beta_prior))
+                    
+                if c_wallet in creator_past_peaks:
+                    peaks = creator_past_peaks[c_wallet]
+                    out[i, 12] = len(peaks)
+                    out[i, 13] = float(np.median(peaks))
+                    out[i, 14] = float(np.max(peaks))
+                    out[i, 15] = float(np.mean([p >= 3.0 for p in peaks]))
+                    out[i, 16] = float(np.mean([p >= 5.0 for p in peaks]))
+                    out[i, 17] = float(peaks[-1])
+                    out[i, 18] = float(cur_t - creator_last_ts.get(c_wallet, cur_t))
                     
     rep_df = pd.DataFrame(out, columns=REPUTATION_COLS)
     rep_df['mint'] = mints

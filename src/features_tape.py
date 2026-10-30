@@ -10,6 +10,14 @@ AMM_COLS   = [
     'pool_base_token_reserves_after', 'pool_quote_token_reserves_after'
 ]
 
+def compute_gini(arr):
+    vals = np.sort(arr[arr > 0])
+    n = len(vals)
+    if n <= 1:
+        return 0.0
+    index = np.arange(1, n + 1)
+    return float((np.sum((2 * index - n - 1) * vals)) / (n * np.sum(vals)))
+
 def extract_tape_features(c_df, a_df):
     """
     Vectorized high-frequency microstructure signals with:
@@ -17,6 +25,10 @@ def extract_tape_features(c_df, a_df):
     - Fee payer relayer mismatch (MEV bot proxy)
     - Creator trading activity in the first minute
     - Window flow acceleration (0-15s, 15-30s, 30-60s)
+    - Second-derivative volume acceleration (d^2 V / dt^2)
+    - Gini coefficient of buy volumes
+    - Wash trading detection (unique buyers ratio, max wallet share)
+    - Launch block early slot sniping (slots 0-2)
     - Reserve pool depth metrics
     """
     if 'signing_wallet' in a_df.columns:
@@ -97,6 +109,57 @@ def extract_tape_features(c_df, a_df):
     ws_norm = ws / ws.groupby('mint').transform('sum').replace(0, np.nan)
     F['amm_hhi'] = (ws_norm ** 2).groupby('mint').sum()
     
+    # Gini coefficient of buy volumes
+    ginis = ws.groupby('mint').apply(lambda s: compute_gini(s.values)).reindex(F.index).fillna(0.0)
+    F['amm_gini'] = ginis
+    
+    # Wash trading detection
+    F['unique_buyers_ratio'] = F['amm_uw'] / F['amm_n'].replace(0, np.nan)
+    max_tx_w = a_df.groupby(['mint', 'wallet']).size().groupby('mint').max()
+    F['wallet_max_tx_share'] = (max_tx_w / F['amm_n'].replace(0, np.nan)).reindex(F.index).fillna(0.0)
+    
+    # Launch block early slot sniping (slots 0 to 2)
+    if 'slot' in a_df.columns:
+        min_slot = a_df.groupby('mint')['slot'].min()
+        a_df['slot_offset'] = a_df['slot'] - a_df['mint'].map(min_slot)
+        early_snipes = a_df[a_df.slot_offset <= 2]
+        
+        early_sol = early_snipes.groupby('mint')['sol'].sum().reindex(F.index).fillna(0.0)
+        early_buys = early_snipes.groupby('mint')['buy_sol'].sum().reindex(F.index).fillna(0.0)
+        early_tx = early_snipes.groupby('mint').size().reindex(F.index).fillna(0)
+        
+        F['slot_snipe_vol_share'] = early_sol / (F['amm_sol'] + 1e-4)
+        F['slot_snipe_buy_share'] = early_buys / (early_sol + 1e-4)
+        F['slot_snipe_tx_count'] = early_tx
+    else:
+        F['slot_snipe_vol_share'] = 0.0
+        F['slot_snipe_buy_share'] = 0.0
+        F['slot_snipe_tx_count'] = 0
+        
+    # Liquidity curve velocity & acceleration (W0: 0-20s, W1: 20-40s, W2: 40-60s)
+    v0 = a_df[a_df.ts_rel < 20].groupby('mint')['sol'].sum().reindex(F.index).fillna(0.0)
+    v1 = a_df[(a_df.ts_rel >= 20) & (a_df.ts_rel < 40)].groupby('mint')['sol'].sum().reindex(F.index).fillna(0.0)
+    v2 = a_df[a_df.ts_rel >= 40].groupby('mint')['sol'].sum().reindex(F.index).fillna(0.0)
+    
+    # Second derivative d^2 V / dt^2 = (V2 - V1) - (V1 - V0) = V2 - 2*V1 + V0
+    F['d2v_dt2'] = v2 - 2.0 * v1 + v0
+    F['rel_flow_accel'] = (v2 - 2.0 * v1 + v0) / (v0 + v1 + v2 + 1e-4)
+    
+    # Buy / Sell Flow dynamics
+    tot_buy_sol = a_df.groupby('mint')['buy_sol'].sum().reindex(F.index).fillna(0.0)
+    tot_sell_sol = a_df.groupby('mint')['sell_sol'].sum().reindex(F.index).fillna(0.0)
+    F['buysell_sol_ratio'] = tot_buy_sol / (tot_sell_sol + 1e-4)
+    F['net_sol_flow'] = tot_buy_sol - tot_sell_sol
+    
+    buy_tx = a_df[a_df.is_buy == 1].groupby('mint').size().reindex(F.index).fillna(0)
+    sell_tx = a_df[a_df.is_buy == 0].groupby('mint').size().reindex(F.index).fillna(0)
+    F['buysell_tx_ratio'] = buy_tx / (sell_tx + 1e-4)
+    
+    # Early dump detection (sells in first 15 seconds)
+    early_dump = a_df[(a_df.ts_rel <= 15) & (a_df.is_buy == 0)].groupby('mint')['sol'].sum().reindex(F.index).fillna(0.0)
+    F['early_dump_sol'] = early_dump
+    F['early_dump_share'] = early_dump / (tot_sell_sol + 1e-4)
+
     # 2. Three Intra-Minute Window Slices: W0 (0-15s), W1 (15-30s), W2 (30-60s)
     w0 = a_df[a_df.ts_rel < 15]
     w1 = a_df[(a_df.ts_rel >= 15) & (a_df.ts_rel < 30)]

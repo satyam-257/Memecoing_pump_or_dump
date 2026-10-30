@@ -1,4 +1,4 @@
-"""End-to-end multi-level Expected Value training, validation, and submission generation."""
+"""End-to-end Two-Stage Decoupled Gatekeeper training, validation, and submission generation."""
 import os
 import sys
 import time
@@ -8,8 +8,8 @@ import pandas as pd
 from src.config import DATA_DIR, LEVELS, COST, WIN, EMBARGO
 from src.features_creation import extract_creation_features
 from src.features_tape import extract_tape_features, CURVE_COLS, AMM_COLS
-from src.features_reputation import build_causal_reputation, REPUTATION_COLS
-from src.models import MultiLevelExpectedValueEngine, optimize_ev_margin
+from src.features_reputation import build_causal_reputation
+from src.models import TwoStageDecisionEngine
 from src.metrics import compute_pnl
 
 def load_dataset():
@@ -47,7 +47,7 @@ def main():
     amm_edges_df = None
     
     if os.path.exists(c_sample) and os.path.exists(a_sample):
-        print("  Processing local sample tapes with direction disambiguation...")
+        print("  Processing local sample tapes with direction disambiguation & Gini...")
         c_cols = [c for c in CURVE_COLS if c not in ('slot', 'tx_idx')] + ['mint', 'failed', 'new_price', 'sol', 'ts_rel']
         a_cols = [c for c in AMM_COLS if c not in ('slot', 'tx_idx')] + ['mint', 'direction', 'base_token', 'new_price', 'sol', 'ts_rel', 'signing_wallet', 'fee_payer']
         
@@ -88,21 +88,21 @@ def main():
     feature_cols = [c for c in TR.columns if c not in exclude_cols and np.issubdtype(TR[c].dtype, np.number)]
     print(f"Total features assembled: {len(feature_cols)}")
     
-    # 4. Multi-Level Expected Value Modeling
-    print("\n[4/5] Training Multi-Level Expected Value Engine across levels:", LEVELS)
-    ev_engine = MultiLevelExpectedValueEngine(feature_cols=feature_cols, levels=LEVELS)
+    # 4. Decoupled Two-Stage Gatekeeper & Utility Maximizer Training
+    print("\n[4/5] Training Decoupled Two-Stage Engine (Stage 1 Gatekeeper + Stage 2 Utility Optimizer)...")
+    engine = TwoStageDecisionEngine(feature_cols=feature_cols, levels=LEVELS)
     
-    # Optimize EV hurdle margin
-    optimal_margin = optimize_ev_margin(ev_engine, TR)
-    print(f"Optimized risk-adjusted EV margin: {optimal_margin:.3f}")
+    engine.fit_gatekeeper(TR)
+    engine.fit_levels(TR)
     
-    # Predict on test set
-    print("\n[5/5] Generating multi-level test predictions and policy allocation...")
-    test_probs = ev_engine.fit_predict_levels(TR, TE)
-    held_payoffs = ev_engine.compute_held_payoffs(TR)
-    test_ev = ev_engine.calculate_expected_values(test_probs, held_payoffs)
+    # 5. Predict on test set
+    print("\n[5/5] Generating calibrated test predictions and selective policy allocation...")
+    test_p_gate = engine.predict_gatekeeper(TE)
+    test_p_levels = engine.predict_levels(TE)
+    miss_payoffs = engine.compute_miss_payoffs(TR)
+    test_ev = engine.calculate_expected_values(test_p_levels, miss_payoffs)
     
-    test_tp, best_ev = ev_engine.decide(test_ev, min_ev_margin=optimal_margin, fallback_q=1.0)
+    test_tp, best_ev = engine.decide(test_p_gate, test_ev, top_n_daily=2, min_prob_hurdle=0.20, min_ev_margin=0.0)
     
     # Build verified submission dataframe
     sub = pd.DataFrame({
