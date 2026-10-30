@@ -13,6 +13,12 @@ workflow_engine
     2) capture stdout (holdout/total Sharpe). If it’s < 0.95, refuse submission and explain the failure mode.
     3) if passed, you are allowed to run the competition via the API.
 
+git_sync_protocol
+    Whenever model training is finished (e.g. train_and_submit.py, model retraining, or pipeline experiment execution):
+    1) Check git status to ensure only relevant code, notebooks, and configs are staged.
+    2) Create a git commit summarizing the training changes and metrics.
+    3) Automatically push the commit to the git remote (git push origin main).
+
 reference_materials
     - ref/01_pipeline_overview.md  
     - ref/02_evaluate_cv_doc.md      
