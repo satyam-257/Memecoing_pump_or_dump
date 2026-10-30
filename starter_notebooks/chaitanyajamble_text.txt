@@ -1,0 +1,1354 @@
+code:
+# This Python 3 environment comes with many helpful analytics libraries installed
+# It is defined by the kaggle/python Docker image: https://github.com/kaggle/docker-python
+# For example, here's several helpful packages to load
+
+import numpy as np # linear algebra
+import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
+
+# Input data files are available in the read-only "../input/" directory
+# For example, running this (by clicking run or pressing Shift+Enter) will list all files under the input directory
+
+import os
+for dirname, _, filenames in os.walk('/kaggle/input'):
+    for filename in filenames:
+        print(os.path.join(dirname, filename))
+
+# You can write up to 20GB to the current directory (/kaggle/working/) that gets preserved as output when you create a version using "Save & Run All" 
+# You can also write temporary files to /kaggle/temp/, but they won't be saved outside of the current session
+
+# Use the kagglehub client library to attach Kaggle resources like competitions, datasets, and models to your session
+# Learn more about kagglehub: https://github.com/Kaggle/kagglehub/blob/main/README.md
+
+import kagglehub
+# kagglehub.dataset_download('<owner>/<dataset-slug>')
+---
+code:
+import gc
+import logging
+import os
+import re
+import sys
+import time
+import traceback
+import warnings
+from pathlib import Path
+ 
+import numpy as np
+import pandas as pd
+ 
+warnings.filterwarnings("ignore")
+ 
+try:  # LightGBM 
+    import lightgbm as lgb
+ 
+    HAS_LGB = True
+except Exception:  
+    lgb = None
+    HAS_LGB = False
+ 
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+ 
+try:
+    import matplotlib
+ 
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+ 
+    HAS_MPL = True
+except Exception:  # pragma: no cover
+    plt = None
+    HAS_MPL = False
+ 
+ 
+class Config:
+    """All tunable settings in one place."""
+ 
+    SEED = 20261002
+    N_JOBS = max(1, min(4, os.cpu_count() or 1))
+ 
+  
+    TRAIN_PATH = "/kaggle/input/competitions/memecoins-pump-or-dump/train.csv"
+    TEST_PATH = "/kaggle/input/competitions/memecoins-pump-or-dump/test.csv"
+ 
+    
+    DATA_DIRS = (
+        "/kaggle/input/competitions/memecoins-pump-or-dump",
+        "/kaggle/input/memecoins-pump-or-dump",
+        "/kaggle/input",
+        "data",
+        ".",
+    )
+    OUTPUT_DIR = "/kaggle/working"
+    EDA_DIRNAME = "eda"
+ 
+    # Task constants
+    WSOL = "So11111111111111111111111111111111111111112"
+    COST = 0.3
+    LABEL_WINDOW = 3600          # seconds until a token outcome is resolved
+    HISTORY_LAG = 7200           # train/test gap: last two hours are not in train
+    TP_MIN, TP_MAX = 3.0, 100.0
+ 
+    # Take-profit levels the model reasons about 
+    LEVELS = (3.0, 4.0, 5.0, 7.0, 10.0, 15.0)
+ 
+    # Feature engineering
+    TOP_WALLETS = 15             
+    USE_WALLET_REPUTATION = True
+    MAX_FEATURES = 90
+    CORR_DROP_THRESHOLD = 0.98
+ 
+    # Validation / modelling
+    OOF_DAYS = 7
+    MIN_TRAIN_ROWS = 3000
+    N_ESTIMATORS = 220
+    FINAL_SEEDS = (0, 17)
+    MIN_EV_GRID = (0.10, 0.20, 0.30, 0.50, 0.75, 1.00, 1.50, 2.00)
+    MIN_OOF_TRADES = 10
+    RISK_AVERSION = 0.25         
+    ALLOW_NEGATIVE_OOF_POLICY = False
+    DEFAULT_MIN_EV = 0.50
+ 
+    # Runtime guards 
+    TIME_BUDGET_SEC = 2700
+    SKIP_EDA_AFTER_SEC = 1500
+    SKIP_CV_AFTER_SEC = 1800
+ 
+    RUN_EDA = True
+    EDA_SAMPLE = 40000
+ 
+ 
+CFG = Config()
+START_TIME = time.time()
+ 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s", datefmt="%H:%M:%S", stream=sys.stdout)
+LOG = logging.getLogger("pumpfun")
+for _noisy in ("matplotlib", "PIL"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+ 
+ 
+def elapsed():
+    return time.time() - START_TIME
+ 
+ 
+def stage(msg):
+    LOG.info("[%6.1fs] %s", elapsed(), msg)
+ 
+ 
+# %% Generic utilities
+def to_num(s, default=np.nan):
+    """Coerce to numeric float and replace inf with NaN; optionally fill."""
+    out = pd.to_numeric(s, errors="coerce").astype("float64")
+    out = out.replace([np.inf, -np.inf], np.nan)
+    return out.fillna(default) if not (isinstance(default, float) and np.isnan(default)) else out
+ 
+ 
+def safe_div(a, b, eps=1e-9):
+    return a / (b + eps)
+ 
+ 
+def get_col(df, name, default=0.0):
+    """Return a column as a Series, or a constant Series if it is missing."""
+    if name in df.columns:
+        return df[name]
+    return pd.Series(default, index=df.index)
+ 
+ 
+def str_col(df, name):
+    return get_col(df, name, "").fillna("").astype(str)
+ 
+ 
+def downcast(df):
+    """Reduce memory of a frame: float64 -> float32, int64 -> smallest int where safe."""
+    for c in df.columns:
+        dt = df[c].dtype
+        if dt == np.float64:
+            df[c] = df[c].astype(np.float32)
+    return df
+ 
+ 
+def find_data_dir():
+    """Locate the folder that contains train.csv, test.csv and sample_submission.csv."""
+    tr, te = Path(CFG.TRAIN_PATH), Path(CFG.TEST_PATH)
+    if tr.is_file() and te.is_file() and tr.parent == te.parent:
+        return tr.parent
+    if tr.is_file() and te.is_file():
+        LOG.warning("train.csv and test.csv are in different folders; using the train.csv folder")
+        return tr.parent
+    seen = []
+    for cand in CFG.DATA_DIRS:
+        p = Path(cand)
+        if not p.exists():
+            continue
+        if (p / "train.csv").exists() and (p / "test.csv").exists():
+            return p
+        seen.append(p)
+    for base in seen:  
+        try:
+            for hit in base.rglob("train.csv"):
+                if (hit.parent / "test.csv").exists():
+                    return hit.parent
+        except Exception:
+            continue
+    raise FileNotFoundError(
+        "Could not find train.csv and test.csv. Searched: " + ", ".join(CFG.DATA_DIRS)
+        + ". Attach the competition data to the notebook."
+    )
+ 
+ 
+def output_dir():
+    p = Path(CFG.OUTPUT_DIR)
+    if not p.exists():
+        p = Path(".")
+    return p
+ 
+ 
+def read_csv_safe(path, usecols=None, mint_filter=None, chunksize=400000, **kw):
+    """Read a CSV with only the columns that exist; optionally keep only some mints (chunked)."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+    header = pd.read_csv(path, nrows=0).columns.tolist()
+    cols = None if usecols is None else [c for c in usecols if c in header]
+    if mint_filter is None or "mint" not in header:
+        return pd.read_csv(path, usecols=cols, low_memory=False, **kw)
+    parts = []
+    for chunk in pd.read_csv(path, usecols=cols, chunksize=chunksize, low_memory=False, **kw):
+        parts.append(chunk[chunk["mint"].isin(mint_filter)])
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=cols)
+ 
+ 
+def read_parquet_safe(path, columns):
+    """Read selected columns of a parquet file, tolerating missing columns and engines."""
+    avail = None
+    try:
+        import pyarrow.parquet as pq
+ 
+        avail = set(pq.ParquetFile(str(path)).schema.names)
+    except Exception:
+        avail = None
+    try:
+        if avail is not None:
+            return pd.read_parquet(path, columns=[c for c in columns if c in avail])
+        df = pd.read_parquet(path)
+        return df[[c for c in columns if c in df.columns]]
+    except Exception as exc:
+        LOG.warning("Could not read %s (%s)", Path(path).name, exc)
+        return pd.DataFrame()
+ 
+ 
+def tape_map(root, key):
+    """Map 'YYYY-MM-DD' -> parquet path, for flattened (day_*) and folder (day=*) layouts."""
+    out = {}
+    for p in Path(root).rglob("*.parquet"):
+        s = str(p)
+        if key not in s:
+            continue
+        m = re.search(r"day[=_-](\d{4}-\d{2}-\d{2})", s)
+        if m:
+            out[m.group(1)] = p
+    return out
+ 
+ 
+# %% Data loading and validation
+def load_core_tables(root):
+    """Load train/test/sample_submission with type checks. Returns (train, test, sample)."""
+    train = pd.read_csv(root / "train.csv", low_memory=False)
+    test = pd.read_csv(root / "test.csv", low_memory=False)
+    sample_path = root / "sample_submission.csv"
+    sample = pd.read_csv(sample_path, low_memory=False) if sample_path.exists() else None
+ 
+    # The competition files name the final multiple 'final_x'; accept common variants.
+    aliases = {"final_x": "finalx", "finalX": "finalx", "final_multiple": "finalx", "maxx": "max_x", "max_X": "max_x"}
+    train.rename(columns={k: v for k, v in aliases.items() if k in train.columns and v not in train.columns}, inplace=True)
+    for name, df in (("train", train), ("test", test)):
+        if df.empty:
+            raise ValueError(f"{name}.csv is empty")
+        if "mint" not in df.columns or "mt" not in df.columns:
+            raise ValueError(f"{name}.csv must contain 'mint' and 'mt' columns; got {list(df.columns)[:12]}")
+    for col in ("max_x", "finalx"):
+        if col not in train.columns:
+            raise ValueError(f"train.csv is missing label column '{col}'")
+ 
+    for df in (train, test):
+        df["mint"] = df["mint"].astype(str)
+        df["mt"] = to_num(df["mt"])
+        if df["mt"].max() > 1e11:  # milliseconds -> seconds
+            df["mt"] = df["mt"] / 1000.0
+        df.dropna(subset=["mt"], inplace=True)
+        df.drop_duplicates("mint", inplace=True)
+        if "day" not in df.columns:
+            df["day"] = pd.to_datetime(df["mt"], unit="s", utc=True).dt.strftime("%Y-%m-%d")
+        df["day"] = df["day"].astype(str).str[:10]
+        for c in ("pre_total", "pre_failed", "entry"):
+            if c in df.columns:
+                df[c] = to_num(df[c])
+        df.reset_index(drop=True, inplace=True)
+ 
+    train["max_x"] = to_num(train["max_x"]).clip(lower=0, upper=1000)
+    train["finalx"] = to_num(train["finalx"]).clip(lower=0, upper=1000)
+    bad = train["max_x"].isna() | train["finalx"].isna()
+    if bad.any():
+        LOG.warning("Dropping %d training rows with invalid labels", int(bad.sum()))
+        train = train.loc[~bad].reset_index(drop=True)
+    # max_x can never be below the realised final multiple of the sustained maximum by construction;
+    # keep the labels as given and only guard against obviously inconsistent rows.
+    if sample is None:
+        sample = pd.DataFrame({"mint": test["mint"].values, "tp": 0.0})
+    else:
+        sample["mint"] = sample["mint"].astype(str)
+    return train, test, sample
+ 
+ 
+def write_submission(sample, tp_by_mint, path):
+    """Write mint,tp in the exact order of sample_submission.csv and validate the file."""
+    sub = sample[["mint"]].drop_duplicates("mint").copy()
+    tp = sub["mint"].map(tp_by_mint) if tp_by_mint is not None else pd.Series(0.0, index=sub.index)
+    tp = pd.to_numeric(tp, errors="coerce").fillna(0.0).astype(float)
+    tp = tp.where((tp == 0) | ((tp >= CFG.TP_MIN) & (tp <= CFG.TP_MAX)), 0.0)
+    sub["tp"] = tp.round(3)
+    text = ["mint,tp"] + [f"{m},{format(float(v), '.6g')}" for m, v in zip(sub["mint"], sub["tp"])]
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text("\n".join(text) + "\n")
+    os.replace(tmp, path)
+    return validate_submission(path, sample)
+ 
+ 
+def validate_submission(path, sample):
+    chk = pd.read_csv(path)
+    assert list(chk.columns) == ["mint", "tp"], "columns must be exactly mint,tp"
+    assert len(chk) == sample["mint"].nunique(), "row count differs from sample_submission"
+    assert chk["mint"].is_unique, "duplicate mints"
+    assert set(chk["mint"]) == set(sample["mint"]), "mint set differs from sample_submission"
+    assert chk["tp"].notna().all(), "NaN in tp"
+    ok = (chk["tp"] == 0) | ((chk["tp"] >= CFG.TP_MIN) & (chk["tp"] <= CFG.TP_MAX))
+    assert ok.all(), "tp outside {0} U [3, 100]"
+    return chk
+ 
+ 
+# %% Feature engineering: shared helpers
+def wallet_concentration(d, wallet_col, prefix, weight_col="sol"):
+    """Per-mint concentration of volume across wallets: top1/top3 share and HHI."""
+    cols = ["mint", wallet_col, weight_col]
+    if d.empty or any(c not in d.columns for c in cols):
+        return pd.DataFrame(columns=["mint"])
+    q = d[cols].copy()
+    q = q[q[wallet_col].notna() & (q[wallet_col] != "")]
+    if q.empty:
+        return pd.DataFrame(columns=["mint"])
+    q = q.groupby(["mint", wallet_col], sort=False)[weight_col].sum().reset_index()
+    q = q.sort_values(["mint", weight_col], ascending=[True, False])
+    q["rk"] = q.groupby("mint", sort=False).cumcount()
+    g = q.groupby("mint", sort=False)[weight_col]
+    out = pd.concat(
+        [
+            g.sum().rename("vol"),
+            g.max().rename("top1"),
+            q[q.rk < 3].groupby("mint", sort=False)[weight_col].sum().rename("top3"),
+            q.assign(_sq=q[weight_col] ** 2).groupby("mint", sort=False)["_sq"].sum().rename("sq"),
+        ],
+        axis=1,
+    ).reset_index()
+    res = pd.DataFrame({"mint": out["mint"]})
+    res[f"{prefix}_top1_share"] = safe_div(out["top1"], out["vol"])
+    res[f"{prefix}_top3_share"] = safe_div(out["top3"], out["vol"])
+    res[f"{prefix}_hhi"] = safe_div(out["sq"], out["vol"] ** 2)
+    return res
+ 
+ 
+def slot_features(d, prefix):
+    """Clustering of trades inside the same slot: bots and bundles arrive together."""
+    if d.empty or "slot" not in d.columns:
+        return pd.DataFrame(columns=["mint"])
+    z = d.groupby(["mint", "slot"], sort=False).size().rename("n").reset_index()
+    z["clustered"] = np.where(z["n"] > 1, z["n"], 0)
+    z["is_cluster"] = (z["n"] > 1).astype(np.int32)
+    out = z.groupby("mint", sort=False).agg(
+        slot_max=("n", "max"), clusters=("is_cluster", "sum"), clustered_trades=("clustered", "sum"), slots=("n", "size")
+    ).reset_index()
+    out = out.rename(columns={c: f"{prefix}_{c}" for c in out.columns if c != "mint"})
+    return out
+ 
+ 
+def roundtrip_wallets(d, buy_col, prefix):
+    """Count wallets that both bought and sold within the window (flippers, not holders)."""
+    if d.empty or "wallet" not in d.columns:
+        return pd.DataFrame(columns=["mint"])
+    w = d.groupby(["mint", "wallet"], sort=False).agg(n=("mint", "size"), buys=(buy_col, "sum")).reset_index()
+    w["rt"] = ((w["buys"] > 0) & (w["n"] - w["buys"] > 0)).astype(np.int32)
+    return w.groupby("mint", sort=False).agg(**{f"{prefix}_roundtrip_wallets": ("rt", "sum")}).reset_index()
+ 
+ 
+def merge_all(frames):
+    frames = [f for f in frames if f is not None and not f.empty and "mint" in f.columns]
+    if not frames:
+        return pd.DataFrame(columns=["mint"])
+    out = frames[0]
+    for f in frames[1:]:
+        out = out.merge(f, on="mint", how="outer")
+    return out
+ 
+ 
+# %% Feature engineering: bonding-curve tape
+CURVE_COLS = [
+    "mint", "ts_rel", "direction", "failed", "sol", "tok", "new_price", "wallet", "signing_wallet",
+    "fee_payer", "slot", "provided_gas_fee", "fee", "consumed_gas", "min_amount_out", "max_amount_in",
+]
+ 
+ 
+def curve_features(d):
+    """Features from the pre-migration bonding-curve tape of one day (executed and failed trades)."""
+    if d is None or d.empty or "mint" not in d.columns:
+        return pd.DataFrame(columns=["mint"])
+    d = d.copy()
+    for c in ("ts_rel", "failed", "sol", "tok", "new_price", "provided_gas_fee", "fee", "consumed_gas",
+              "min_amount_out", "max_amount_in"):
+        d[c] = to_num(get_col(d, c, 0.0), 0.0)
+    wallet = str_col(d, "wallet")
+    d["wallet"] = wallet.where(wallet != "", str_col(d, "signing_wallet"))
+    d["_buy"] = str_col(d, "direction").str.lower().eq("buy")
+    d = d[d["ts_rel"] <= 0]
+    ex = d[d["failed"] == 0].copy()
+    fl = d[d["failed"] != 0].copy()
+    parts = []
+ 
+    if not ex.empty:
+        sort_cols = ["mint", "ts_rel"] + (["slot"] if "slot" in ex.columns else [])
+        ex = ex.sort_values(sort_cols, kind="mergesort")
+        ex["_buy_sol"] = ex["sol"] * ex["_buy"]
+        ex["_sell_sol"] = ex["sol"] * (~ex["_buy"])
+        for secs in (600, 120, 30):
+            m = ex["ts_rel"] >= -secs
+            ex[f"_l{secs}_sol"] = ex["sol"] * m
+            ex[f"_l{secs}_n"] = m.astype(np.int32)
+        ex["_mismatch"] = (str_col(ex, "signing_wallet") != str_col(ex, "fee_payer")).astype(np.int8) if "fee_payer" in ex.columns else 0
+        ex["_sell_n"] = (~ex["_buy"]).astype(np.int32)
+        g = ex.groupby("mint", sort=False)
+        o = g.agg(
+            c_n=("mint", "size"), c_wallets=("wallet", "nunique"), c_sol=("sol", "sum"), c_sol_max=("sol", "max"),
+            c_sol_med=("sol", "median"), c_buy_sol=("_buy_sol", "sum"), c_buy_sol_max=("_buy_sol", "max"),
+            c_sell_sol=("_sell_sol", "sum"), c_sell_n=("_sell_n", "sum"), c_ts_first=("ts_rel", "min"),
+            c_price_first=("new_price", "first"), c_price_last=("new_price", "last"), c_price_min=("new_price", "min"),
+            c_price_max=("new_price", "max"), c_l600_sol=("_l600_sol", "sum"), c_l120_sol=("_l120_sol", "sum"),
+            c_l30_sol=("_l30_sol", "sum"), c_l600_n=("_l600_n", "sum"), c_l120_n=("_l120_n", "sum"),
+            c_l30_n=("_l30_n", "sum"), c_gas_mean=("provided_gas_fee", "mean"), c_fee_mean=("fee", "mean"),
+            c_cu_mean=("consumed_gas", "mean"), c_fee_mismatch=("_mismatch", "mean"),
+        ).reset_index()
+        o["c_buy_share"] = safe_div(o["c_buy_sol"], o["c_sol"])
+        o["c_net_buy_share"] = safe_div(o["c_buy_sol"] - o["c_sell_sol"], o["c_sol"])
+        o["c_sell_n_share"] = safe_div(o["c_sell_n"], o["c_n"])
+        o["c_duration"] = (-o["c_ts_first"]).clip(lower=0)
+        o["c_trades_per_wallet"] = safe_div(o["c_n"], o["c_wallets"])
+        for secs in (600, 120, 30):
+            o[f"c_l{secs}_vol_share"] = safe_div(o[f"c_l{secs}_sol"], o["c_sol"])
+            o[f"c_l{secs}_n_share"] = safe_div(o[f"c_l{secs}_n"], o["c_n"])
+        o["c_price_ret"] = safe_div(o["c_price_last"], o["c_price_first"]) - 1
+        o["c_peak_drawdown"] = safe_div(o["c_price_last"], o["c_price_max"]) - 1
+        o["c_price_position"] = safe_div(o["c_price_last"] - o["c_price_min"], o["c_price_max"] - o["c_price_min"])
+        parts += [o, wallet_concentration(ex, "wallet", "c"), slot_features(ex, "c"), roundtrip_wallets(ex, "_buy", "c")]
+ 
+    if not fl.empty:
+        fl["_recent60"] = (fl["ts_rel"] >= -60).astype(np.int32)
+        fl["_recent600"] = (fl["ts_rel"] >= -600).astype(np.int32)
+        fl["_minout_nz"] = (fl["min_amount_out"] > 0).astype(np.int32)
+        fl["_maxin_nz"] = (fl["max_amount_in"] > 0).astype(np.int32)
+        fl["_buyi"] = fl["_buy"].astype(np.int32)
+        f = fl.groupby("mint", sort=False).agg(
+            cf_n=("mint", "size"), cf_wallets=("wallet", "nunique"), cf_buy_n=("_buyi", "sum"),
+            cf_recent60=("_recent60", "sum"), cf_recent600=("_recent600", "sum"), cf_gas_mean=("provided_gas_fee", "mean"),
+            cf_gas_max=("provided_gas_fee", "max"), cf_minout_nz=("_minout_nz", "mean"), cf_maxin_nz=("_maxin_nz", "mean"),
+        ).reset_index()
+        f["cf_buy_share"] = safe_div(f["cf_buy_n"], f["cf_n"])
+        f["cf_recent60_share"] = safe_div(f["cf_recent60"], f["cf_n"])
+        parts.append(f)
+    return merge_all(parts)
+ 
+ 
+# %% Feature engineering: PumpSwap first minute
+AMM_COLS = [
+    "mint", "ts_rel", "direction", "base_token", "sol", "tok", "new_price", "signing_wallet", "fee_payer", "slot",
+    "provided_gas_fee", "fee", "pool_base_token_reserves_after", "pool_quote_token_reserves_after", "coin_creator",
+    "lp_fee", "protocol_fee", "coin_creator_fees",
+]
+AMM_WINDOWS = ((0, 15), (15, 30), (30, 61))
+ 
+ 
+def amm_features(d):
+    """First-60-seconds features. Returns (features, top-buyer table for wallet reputation)."""
+    empty_buyers = pd.DataFrame(columns=["mint", "wallet", "cur_sol"])
+    if d is None or d.empty or "mint" not in d.columns:
+        return pd.DataFrame(columns=["mint"]), empty_buyers
+    d = d.copy()
+    for c in ("ts_rel", "sol", "tok", "new_price", "provided_gas_fee", "fee", "pool_base_token_reserves_after",
+              "pool_quote_token_reserves_after", "lp_fee", "protocol_fee", "coin_creator_fees"):
+        d[c] = to_num(get_col(d, c, 0.0), 0.0)
+    d = d[(d["ts_rel"] >= 0) & (d["ts_rel"] <= 60)].copy()
+    if d.empty:
+        return pd.DataFrame(columns=["mint"]), empty_buyers
+ 
+    # direction is relative to base_token: when SOL is the base, 'B' means the memecoin is SOLD.
+    raw_b = str_col(d, "direction").str.upper().str.startswith("B")
+    sol_is_base = str_col(d, "base_token").eq(CFG.WSOL)
+    d["_buy"] = np.where(sol_is_base, ~raw_b, raw_b)
+    d["wallet"] = str_col(d, "signing_wallet")
+    d["_buy_sol"] = d["sol"] * d["_buy"]
+    d["_sell_sol"] = d["sol"] * (~d["_buy"])
+    d["_mismatch"] = (d["wallet"] != str_col(d, "fee_payer")).astype(np.int8) if "fee_payer" in d.columns else 0
+    creator = str_col(d, "coin_creator")
+    d["_creator"] = ((d["wallet"] == creator) & (creator != "")).astype(np.int8)
+    d["_creator_sell_sol"] = d["sol"] * d["_creator"] * (~d["_buy"])
+    d["_creator_buy_sol"] = d["sol"] * d["_creator"] * d["_buy"]
+    # SOL-side reserve in SOL units (9 decimals)
+    d["_depth"] = np.where(sol_is_base, d["pool_base_token_reserves_after"], d["pool_quote_token_reserves_after"]) / 1e9
+    sort_cols = ["mint", "ts_rel"] + (["slot"] if "slot" in d.columns else [])
+    d = d.sort_values(sort_cols, kind="mergesort")
+    for i, (lo, hi) in enumerate(AMM_WINDOWS):
+        m = (d["ts_rel"] >= lo) & (d["ts_rel"] < hi)
+        d[f"_w{i}_n"] = m.astype(np.int32)
+        d[f"_w{i}_sol"] = d["sol"] * m
+        d[f"_w{i}_buy"] = d["sol"] * m * d["_buy"]
+ 
+    agg = dict(
+        a_n=("mint", "size"), a_wallets=("wallet", "nunique"), a_sol=("sol", "sum"), a_sol_max=("sol", "max"),
+        a_sol_med=("sol", "median"), a_buy_n=("_buy", "sum"), a_buy_sol=("_buy_sol", "sum"),
+        a_buy_sol_max=("_buy_sol", "max"), a_sell_sol=("_sell_sol", "sum"), a_price_first=("new_price", "first"),
+        a_price_last=("new_price", "last"), a_price_min=("new_price", "min"), a_price_max=("new_price", "max"),
+        a_depth_first=("_depth", "first"), a_depth_last=("_depth", "last"), a_depth_min=("_depth", "min"),
+        a_depth_max=("_depth", "max"), a_fee_mismatch=("_mismatch", "mean"), a_gas_mean=("provided_gas_fee", "mean"),
+        a_gas_max=("provided_gas_fee", "max"), a_lp_fee=("lp_fee", "sum"), a_protocol_fee=("protocol_fee", "sum"),
+        a_creator_fees=("coin_creator_fees", "sum"), a_creator_trade_share=("_creator", "mean"),
+        a_creator_buy_sol=("_creator_buy_sol", "sum"), a_creator_sell_sol=("_creator_sell_sol", "sum"),
+    )
+    for i in range(len(AMM_WINDOWS)):
+        agg[f"a_w{i}_n"] = (f"_w{i}_n", "sum")
+        agg[f"a_w{i}_sol"] = (f"_w{i}_sol", "sum")
+        agg[f"a_w{i}_buy"] = (f"_w{i}_buy", "sum")
+    o = d.groupby("mint", sort=False).agg(**agg).reset_index()
+ 
+    o["a_sell_n"] = o["a_n"] - o["a_buy_n"]
+    o["a_buy_share"] = safe_div(o["a_buy_sol"], o["a_sol"])
+    o["a_net_buy_share"] = safe_div(o["a_buy_sol"] - o["a_sell_sol"], o["a_sol"])
+    o["a_price_ret"] = safe_div(o["a_price_last"], o["a_price_first"]) - 1
+    o["a_peak_drawdown"] = safe_div(o["a_price_last"], o["a_price_max"]) - 1
+    o["a_price_range"] = safe_div(o["a_price_max"], o["a_price_min"]) - 1
+    o["a_depth_ret"] = safe_div(o["a_depth_last"], o["a_depth_first"]) - 1
+    o["a_flow_accel"] = safe_div(o["a_w2_sol"], o["a_w0_sol"]) - 1       # 30-60s volume vs 0-15s volume
+    o["a_bp_0_15"] = safe_div(o["a_w0_buy"], o["a_w0_sol"])
+    o["a_bp_15_30"] = safe_div(o["a_w1_buy"], o["a_w1_sol"])
+    o["a_bp_30_60"] = safe_div(o["a_w2_buy"], o["a_w2_sol"])
+    o["a_bp_delta"] = o["a_bp_30_60"] - o["a_bp_0_15"]
+    o = o.merge(wallet_concentration(d, "wallet", "a"), on="mint", how="left")
+    o = o.merge(slot_features(d, "a"), on="mint", how="left")
+    o = o.merge(roundtrip_wallets(d, "_buy", "a"), on="mint", how="left")
+ 
+    buyers = d[d["_buy"] & (d["wallet"] != "")].groupby(["mint", "wallet"], sort=False)["sol"].sum().reset_index(name="cur_sol")
+    buyers = buyers.sort_values(["mint", "cur_sol"], ascending=[True, False])
+    buyers = buyers[buyers.groupby("mint", sort=False).cumcount() < CFG.TOP_WALLETS]
+    return o, buyers
+ 
+ 
+# %% Feature engineering: per-day tape extraction (memory-bounded)
+def extract_tape_features(root, base):
+    """Read one day of each tape at a time, keep only that day's tokens, return features + buyers."""
+    c_map = tape_map(root, "pumpfun_all_swaps")
+    a_map = tape_map(root, "pumpswap_all_swaps")
+    stage(f"tape files found: curve={len(c_map)} amm={len(a_map)}")
+    feats, buyers_all = [], []
+    for day in sorted(base["day"].unique()):
+        mints = set(base.loc[base["day"] == day, "mint"])
+        z = pd.DataFrame({"mint": list(mints)})
+        has_c = has_a = 0
+        try:
+            if day in c_map:
+                c = read_parquet_safe(c_map[day], CURVE_COLS)
+                if not c.empty and "mint" in c.columns:
+                    c = c[c["mint"].isin(mints)]
+                    cf = curve_features(c)
+                    if not cf.empty:
+                        z = z.merge(cf, on="mint", how="left")
+                        has_c = 1
+                del c
+        except Exception as exc:
+            LOG.warning("curve features failed for %s: %s", day, exc)
+        try:
+            if day in a_map:
+                a = read_parquet_safe(a_map[day], AMM_COLS)
+                if not a.empty and "mint" in a.columns:
+                    a = a[a["mint"].isin(mints)]
+                    af, by = amm_features(a)
+                    if not af.empty:
+                        z = z.merge(af, on="mint", how="left")
+                        has_a = 1
+                    if not by.empty:
+                        buyers_all.append(by)
+                del a
+        except Exception as exc:
+            LOG.warning("amm features failed for %s: %s", day, exc)
+        z["has_curve_tape"] = np.int8(has_c)
+        z["has_amm_tape"] = np.int8(has_a)
+        feats.append(downcast(z))
+        gc.collect()
+    tape = pd.concat(feats, ignore_index=True) if feats else pd.DataFrame({"mint": base["mint"]})
+    buyers = pd.concat(buyers_all, ignore_index=True) if buyers_all else pd.DataFrame(columns=["mint", "wallet", "cur_sol"])
+    return tape.drop_duplicates("mint"), buyers
+ 
+ 
+# %% Feature engineering: launch metadata
+CREATION_COLS = [
+    "mint", "created_ts", "creator", "name", "symbol", "url", "bundle_size", "gas_used", "amount_of_instructions",
+    "amount_of_lookup_reads", "amount_of_lookup_writes", "bundle_structure", "bundled_buys", "bundled_buys_count",
+    "dev_balance", "creation_ix_index", "pf_program_index", "direct_pf_invocation", "mayhem_mode", "token_program",
+    "is_cashback_enabled",
+]
+MIGRATION_COLS = ["mint", "mt", "user", "mint_amount", "sol_amount", "pool_migration_fee", "tx_idx"]
+ 
+ 
+def launch_features(base, creation, migrations):
+    """Token-creation and migration metadata plus quantities already present in train/test."""
+    x = base[["mint", "mt", "day"]].copy()
+    for c in ("pre_total", "pre_failed", "entry"):
+        x[c] = base[c].values if c in base.columns else np.nan
+    if creation is not None and not creation.empty:
+        c = creation.drop_duplicates("mint")
+        x = x.merge(c, on="mint", how="left")
+    if migrations is not None and not migrations.empty and "mt" in migrations.columns:
+        m = migrations.copy()
+        m["mt"] = to_num(m["mt"])
+        if m["mt"].max() > 1e11:
+            m["mt"] = m["mt"] / 1000.0
+        m = m.sort_values(["mint", "mt"]).drop_duplicates(["mint", "mt"], keep="last")
+        joined = x.merge(m, on=["mint", "mt"], how="left", suffixes=("", "_mig"))
+        probe = "sol_amount" if "sol_amount" in joined.columns else None
+        if probe is not None and joined[probe].notna().mean() < 0.5:
+            # timestamps differ between tables: join on mint only, keeping the latest migration
+            LOG.warning("migration join on (mint, mt) matched few rows; joining on mint only")
+            joined = x.merge(m.drop_duplicates("mint", keep="last").drop(columns=["mt"]), on="mint", how="left", suffixes=("", "_mig"))
+        x = joined
+ 
+    out = x[["mint", "mt", "day", "pre_total", "pre_failed", "entry"]].copy()
+    out["fail_ratio"] = safe_div(out["pre_failed"], out["pre_total"] + out["pre_failed"])
+    out["log_pre_total"] = np.log1p(out["pre_total"].clip(lower=0))
+    out["log_pre_failed"] = np.log1p(out["pre_failed"].clip(lower=0))
+    out["log_entry"] = np.log(np.clip(out["entry"], 1e-18, None))
+    out["has_creation"] = x["created_ts"].notna().astype(np.int8) if "created_ts" in x.columns else np.int8(0)
+ 
+    if "created_ts" in x.columns:
+        age = (x["mt"] - to_num(x["created_ts"])).clip(lower=0)
+        out["age_sec"] = age
+        out["log_age_sec"] = np.log1p(age)
+        out["age_lt_1h"] = (age < 3600).astype(np.int8)
+    for col in ("bundle_size", "gas_used", "amount_of_instructions", "amount_of_lookup_reads", "amount_of_lookup_writes",
+                "bundled_buys", "bundled_buys_count", "dev_balance", "creation_ix_index", "pf_program_index",
+                "direct_pf_invocation", "mayhem_mode", "is_cashback_enabled"):
+        if col in x.columns:
+            out[col] = to_num(x[col])
+    bb = to_num(get_col(x, "bundled_buys", np.nan))
+    db = to_num(get_col(x, "dev_balance", np.nan))
+    out["bundled_share_supply"] = bb / 1e15      # 1e9 supply * 1e6 decimals
+    out["dev_share_supply"] = db / 1e15
+    out["insider_overhang"] = out["bundled_share_supply"].fillna(0) + out["dev_share_supply"].fillna(0)
+    out["bundle_buy_per_count"] = safe_div(bb, to_num(get_col(x, "bundled_buys_count", np.nan)))
+    for col, new, div in (("sol_amount", "migration_sol", 1e9), ("mint_amount", "migration_token", 1e6),
+                          ("pool_migration_fee", "migration_fee_sol", 1e9)):
+        if col in x.columns:
+            out[new] = to_num(x[col]) / div
+    if "migration_sol" in out.columns:
+        out["log_migration_sol"] = np.log1p(out["migration_sol"].clip(lower=0))
+    if "tx_idx" in x.columns:
+        out["migration_tx_idx"] = to_num(x["tx_idx"])
+    if "creator" in x.columns and "user" in x.columns:
+        out["creator_is_migrator"] = (str_col(x, "creator") == str_col(x, "user")).astype(np.int8)
+ 
+    dt = pd.to_datetime(x["mt"], unit="s", utc=True)
+    out["hour_sin"] = np.sin(2 * np.pi * dt.dt.hour / 24)
+    out["hour_cos"] = np.cos(2 * np.pi * dt.dt.hour / 24)
+    out["dow_sin"] = np.sin(2 * np.pi * dt.dt.dayofweek / 7)
+    out["dow_cos"] = np.cos(2 * np.pi * dt.dt.dayofweek / 7)
+    out["is_weekend"] = (dt.dt.dayofweek >= 5).astype(np.int8)
+ 
+    for col in ("name", "symbol"):  # text -> numeric descriptors; raw text is never fed to the model
+        if col in x.columns:
+            s = str_col(x, col)
+            out[f"{col}_len"] = s.str.len()
+            out[f"{col}_digits"] = s.str.count(r"\d")
+            out[f"{col}_upper_share"] = safe_div(s.str.count(r"[A-Z]"), s.str.len())
+            out[f"{col}_nonascii"] = s.map(lambda z: sum(ord(ch) > 127 for ch in z))
+            out[f"{col}_spaces"] = s.str.count(r"\s")
+    if "name" in x.columns and "symbol" in x.columns:
+        norm = lambda s: str_col(x, s).str.lower().str.replace("$", "", regex=False)
+        out["name_symbol_same"] = (norm("name") == norm("symbol")).astype(np.int8)
+    if "url" in x.columns:
+        s = str_col(x, "url").str.lower()
+        out["url_len"] = s.str.len()
+        out["url_ipfs"] = s.str.contains("ipfs", regex=False).astype(np.int8)
+        out["url_http"] = s.str.startswith("http").astype(np.int8)
+    if "bundle_structure" in x.columns:
+        s = str_col(x, "bundle_structure")
+        out["bundle_struct_len"] = s.str.len()
+        out["bundle_buy_ops"] = s.str.count(r"\d+B")
+        out["bundle_transfer_ops"] = s.str.count(r"\d+T:")
+        out["bundle_ata_ops"] = s.str.count("ATA")
+    if "token_program" in x.columns:
+        out["token2022"] = str_col(x, "token_program").str.startswith("TokenzQ").astype(np.int8)
+    out["creator"] = str_col(x, "creator") if "creator" in x.columns else ""
+    return out
+ 
+ 
+# %% Feature engineering: causal history (outcome-based reputation and market regime)
+def outcome_table(train):
+    """Per-token outcome values used by reputation features. Resolved one hour after migration."""
+    mx = train["max_x"].values.astype(np.float64)
+    fx = train["finalx"].values.astype(np.float64)
+    return pd.DataFrame({
+        "mint": train["mint"].values,
+        "resolve_t": train["mt"].values + CFG.LABEL_WINDOW,
+        "one": 1.0,
+        "y3": (mx >= 3).astype(np.float64),
+        "y5": (mx >= 5).astype(np.float64),
+        "y10": (mx >= 10).astype(np.float64),
+        "lmx": np.log1p(np.clip(mx, 0, 100)),
+        "held": np.maximum(fx - 1.3, -1.0),
+    })
+ 
+ 
+def query_times(x):
+    """Information cut-off per token: start of its UTC day minus the train/test gap.
+    Test tokens naturally see only labels that ended two hours before their day; applying the
+    same cut-off to training rows keeps train and test features identically stale."""
+    # Resolution-independent epoch seconds (pandas versions differ in the default datetime unit).
+    dt = pd.to_datetime(x["day"], utc=True, errors="coerce")
+    day_start = ((dt - pd.Timestamp("1970-01-01", tz="UTC")) // pd.Timedelta(seconds=1)).astype("float64").values
+    day_start = np.where(np.isfinite(day_start) & (day_start > 0), day_start, x["mt"].values)
+    return day_start - CFG.HISTORY_LAG
+ 
+ 
+def asof_reputation(queries, hist, key, prefix):
+    """Cumulative, strictly causal outcome statistics per key (creator or wallet).
+ 
+    queries: DataFrame[key, qtime, ...]; hist: DataFrame[key, resolve_t, one, y3, y5, y10, lmx, held].
+    A history event counts only if its resolve_t <= the query cut-off."""
+    vals = ["one", "y3", "y5", "y10", "lmx", "held"]
+    h = hist.sort_values([key, "resolve_t"], kind="mergesort").copy()
+    h[vals] = h.groupby(key, sort=False)[vals].cumsum()
+    q = queries.sort_values("qtime", kind="mergesort")
+    h = h.sort_values("resolve_t", kind="mergesort")
+    m = pd.merge_asof(q, h[[key, "resolve_t"] + vals], left_on="qtime", right_on="resolve_t", by=key, direction="backward")
+    for v in vals:
+        m[v] = m[v].fillna(0.0)
+    m = m.rename(columns={"one": f"{prefix}_n"})
+    n = m[f"{prefix}_n"].values
+    for v in ("y3", "y5", "y10", "lmx", "held"):
+        m[f"{prefix}_{v}"] = np.where(n > 0, m[v].values / np.maximum(n, 1), np.nan)
+    return m
+ 
+ 
+def add_creator_history(x, train):
+    out = x[["mint", "creator", "day", "mt"]].copy()
+    out["qtime"] = query_times(x)
+    hist = outcome_table(train).merge(x[["mint", "creator"]], on="mint", how="left")
+    hist = hist[hist["creator"].fillna("") != ""].rename(columns={"creator": "key"})
+    q = out[out["creator"].fillna("") != ""].rename(columns={"creator": "key"})[["mint", "key", "qtime"]]
+    if hist.empty or q.empty:
+        return pd.DataFrame({"mint": x["mint"]})
+    m = asof_reputation(q, hist.drop(columns=["mint"]), "key", "creator")
+    cols = ["mint"] + [c for c in m.columns if c.startswith("creator_")]
+    return m[cols].drop_duplicates("mint")
+ 
+ 
+def add_wallet_reputation(x, train, buyers):
+    """Weighted outcome history of the first-minute buyers (legal: resolved history only)."""
+    if buyers is None or buyers.empty:
+        return pd.DataFrame({"mint": x["mint"]})
+    q = buyers.merge(x[["mint"]].assign(qtime=query_times(x)), on="mint", how="inner")
+    h = buyers.merge(outcome_table(train), on="mint", how="inner").drop(columns=["mint", "cur_sol"])
+    if q.empty or h.empty:
+        return pd.DataFrame({"mint": x["mint"]})
+    codes, _ = pd.factorize(pd.concat([q["wallet"], h["wallet"]], ignore_index=True))
+    q["key"], h["key"] = codes[: len(q)], codes[len(q):]
+    m = asof_reputation(q[["mint", "key", "qtime", "cur_sol"]], h.drop(columns=["wallet"]), "key", "w")
+    m["known"] = (m["w_n"] > 0).astype(np.float64)
+    tot = m.groupby("mint")["cur_sol"].transform("sum")
+    m["wt"] = np.where(tot > 0, m["cur_sol"] / tot.replace(0, np.nan), 1.0 / m.groupby("mint")["cur_sol"].transform("size"))
+    kw = m["wt"] * m["known"]
+    res = pd.DataFrame({"mint": m["mint"].values})
+    res["_kw"] = kw.values
+    res["wallet_cur_n"] = 1.0
+    res["wallet_known_n"] = m["known"].values
+    res["wallet_known_share"] = m["known"].values
+    res["wallet_hist_n_max"] = m["w_n"].values
+    for v in ("y3", "y5", "y10", "lmx", "held"):
+        res[f"_p_{v}"] = (kw * m[f"w_{v}"].fillna(0.0)).values
+    res["_r5_best"] = np.where(m["w_n"].values >= 2, m["w_y5"].fillna(0.0).values, 0.0)
+    g = res.groupby("mint", sort=False)
+    agg = g.agg(
+        wallet_cur_n=("wallet_cur_n", "sum"), wallet_known_n=("wallet_known_n", "sum"),
+        wallet_known_share=("wallet_known_share", "mean"), wallet_hist_n_max=("wallet_hist_n_max", "max"),
+        wallet_r5_best2=("_r5_best", "max"), _kw=("_kw", "sum"),
+        **{f"_p_{v}": (f"_p_{v}", "sum") for v in ("y3", "y5", "y10", "lmx", "held")},
+    ).reset_index()
+    for v in ("y3", "y5", "y10", "lmx", "held"):
+        agg[f"wallet_{v}_wavg"] = np.where(agg["_kw"] > 0, agg[f"_p_{v}"] / agg["_kw"].replace(0, np.nan), np.nan)
+    return agg[["mint", "wallet_cur_n", "wallet_known_n", "wallet_known_share", "wallet_hist_n_max", "wallet_r5_best2"]
+               + [f"wallet_{v}_wavg" for v in ("y3", "y5", "y10", "lmx", "held")]]
+ 
+ 
+def add_market_regime(x, train):
+    """Recent market regime: activity counts (all tokens, backward-looking) and resolved outcome rates."""
+    out = pd.DataFrame({"mint": x["mint"].values})
+    t = x["mt"].values.astype(np.int64)
+    all_t = np.sort(t)
+    for sec, nm in ((21600, "6h"), (86400, "24h")):
+        out[f"activity_{nm}"] = (np.searchsorted(all_t, t, side="left") - np.searchsorted(all_t, t - sec, side="left")).astype(np.float32)
+ 
+    o = outcome_table(train).sort_values("resolve_t")
+    rt = o["resolve_t"].values
+    cs = {c: np.r_[0.0, np.cumsum(o[c].values)] for c in ("one", "y3", "y5", "y10", "lmx", "held")}
+    q = query_times(x)
+    for sec, nm in ((21600, "6h"), (86400, "24h"), (259200, "3d")):
+        r = np.searchsorted(rt, q, side="right")
+        l = np.searchsorted(rt, q - sec, side="left")
+        n = (r - l).astype(np.float64)
+        out[f"mkt_{nm}_n"] = n.astype(np.float32)
+        for c, label in (("y3", "r3"), ("y5", "r5"), ("y10", "r10"), ("lmx", "logmax"), ("held", "heldpay")):
+            out[f"mkt_{nm}_{label}"] = np.where(n > 0, (cs[c][r] - cs[c][l]) / np.maximum(n, 1), np.nan).astype(np.float32)
+    return out
+ 
+ 
+def add_cross_features(x):
+    """Ratios between curve, pool and launch quantities."""
+    def has(*cols):
+        return all(c in x.columns for c in cols)
+    if has("cf_n", "c_n"):
+        x["raw_fail_share"] = safe_div(x["cf_n"].fillna(0), x["cf_n"].fillna(0) + x["c_n"].fillna(0))
+    if has("a_n", "c_n"):
+        x["amm_curve_trade_ratio"] = safe_div(x["a_n"], x["c_n"])
+    if has("a_wallets", "c_wallets"):
+        x["amm_curve_wallet_ratio"] = safe_div(x["a_wallets"], x["c_wallets"])
+    if has("a_sol", "c_sol"):
+        x["amm_curve_sol_ratio"] = safe_div(x["a_sol"], x["c_sol"])
+    if has("a_sol", "a_depth_first"):
+        x["amm_turnover_depth"] = safe_div(x["a_sol"], x["a_depth_first"])
+    if has("a_buy_sol_max", "a_depth_first"):
+        x["amm_max_buy_depth"] = safe_div(x["a_buy_sol_max"], x["a_depth_first"])
+    if has("a_w2_sol", "a_depth_last"):
+        x["amm_late_depth"] = safe_div(x["a_w2_sol"], x["a_depth_last"])
+    if has("a_creator_sell_sol", "a_depth_last"):
+        x["creator_sell_depth"] = safe_div(x["a_creator_sell_sol"], x["a_depth_last"])
+    if has("a_bp_30_60", "a_top1_share", "a_w2_sol"):
+        x["organic_late_flow"] = x["a_bp_30_60"].fillna(0) * (1 - x["a_top1_share"].fillna(1).clip(0, 1)) * np.log1p(x["a_w2_sol"].fillna(0).clip(lower=0))
+    if has("a_depth_last", "migration_sol"):
+        x["depth_vs_migration"] = safe_div(x["a_depth_last"], x["migration_sol"])
+    # Log versions of heavy-tailed non-negative counts and volumes
+    keys = ("_n", "wallets", "_sol", "depth", "gas", "fee", "duration", "activity", "pre_total", "pre_failed", "age_sec")
+    skip = {"mt", "max_x", "finalx", "is_train"}
+    for c in list(x.columns):
+        if c.startswith("lg_") or c in skip or not pd.api.types.is_numeric_dtype(x[c]):
+            continue
+        if any(k in c for k in keys):
+            v = x[c]
+            if v.notna().any() and (v.dropna() >= 0).all() and v.dropna().max() > 50:
+                x[f"lg_{c}"] = np.log1p(v)
+    return x
+ 
+ 
+def build_feature_frame(root, train, test, creation, migrations):
+    """Assemble all features for train and test tokens in one frame (row order = train then test)."""
+    base = pd.concat([train.assign(is_train=1), test.assign(is_train=0)], ignore_index=True, sort=False)
+    for c in ("max_x", "finalx"):
+        if c not in base.columns:
+            base[c] = np.nan
+    x = launch_features(base, creation, migrations)
+    x["is_train"] = base["is_train"].values
+    x["max_x"] = base["max_x"].values
+    x["finalx"] = base["finalx"].values
+    stage(f"launch features: {x.shape[1]} columns")
+ 
+    tape, buyers = extract_tape_features(root, base[["mint", "day"]])
+    x = x.merge(tape, on="mint", how="left")
+    # train.csv / test.csv may not carry these columns; rebuild them from the tapes (same definitions)
+    if "c_n" in x.columns:
+        x["pre_total"] = x["pre_total"].fillna(x["c_n"])
+    if "cf_n" in x.columns:
+        x["pre_failed"] = x["pre_failed"].fillna(x["cf_n"].fillna(0)) if "c_n" in x.columns else x["pre_failed"]
+    if "a_price_last" in x.columns:
+        x["entry"] = x["entry"].fillna(x["a_price_last"])
+    x["fail_ratio"] = safe_div(x["pre_failed"], x["pre_total"] + x["pre_failed"])
+    x["log_entry"] = np.log(np.clip(x["entry"].astype("float64"), 1e-18, None))
+    x["log_pre_total"] = np.log1p(x["pre_total"].clip(lower=0))
+    x["log_pre_failed"] = np.log1p(x["pre_failed"].clip(lower=0))
+    stage(f"tape features merged: {x.shape[1]} columns")
+ 
+    lab = base.loc[base["is_train"] == 1, ["mint", "mt", "max_x", "finalx"]]
+    for name, fn in (
+        ("market regime", lambda: add_market_regime(x, lab)),
+        ("creator history", lambda: add_creator_history(x, lab)),
+        ("wallet reputation", (lambda: add_wallet_reputation(x, lab, buyers)) if CFG.USE_WALLET_REPUTATION else None),
+    ):
+        if fn is None:
+            continue
+        try:
+            f = fn()
+            if f is not None and f.shape[1] > 1:
+                x = x.merge(f, on="mint", how="left")
+        except Exception as exc:
+            LOG.warning("%s skipped: %s", name, exc)
+    x = add_cross_features(x)
+    x = x.replace([np.inf, -np.inf], np.nan)
+    num_cols = [c for c in x.columns if c != "mt" and pd.api.types.is_numeric_dtype(x[c])]
+    x[num_cols] = x[num_cols].astype(np.float32)   # memory: float32 everywhere except the timestamp
+    x["mt"] = base["mt"].values.astype(np.float64)
+    del tape, buyers
+    gc.collect()
+    return x
+ 
+ 
+# %% Feature selection
+def candidate_columns(x):
+    banned = {"mint", "mt", "day", "is_train", "max_x", "finalx", "creator"}
+    tr = x[x["is_train"] == 1]
+    cols = []
+    for c in x.columns:
+        if c in banned or not pd.api.types.is_numeric_dtype(x[c]):
+            continue
+        v = tr[c]
+        if v.notna().mean() < 0.02 or v.nunique(dropna=True) <= 1:  # nearly empty or constant
+            continue
+        cols.append(c)
+    return cols
+ 
+ 
+def drop_correlated(x, cols, threshold, sample=30000):
+    """Remove one feature of every near-duplicate pair using a training subsample."""
+    tr = x[x["is_train"] == 1]
+    sub = tr[cols].sample(min(sample, len(tr)), random_state=CFG.SEED)
+    corr = sub.rank(pct=True).corr().abs().values  # Spearman via ranks
+    keep, dropped = [], set()
+    miss = sub.isna().mean().values
+    order = np.argsort(miss)  # prefer features with fewer missing values
+    for i in order:
+        if i in dropped:
+            continue
+        keep.append(i)
+        dups = np.where(corr[i] > threshold)[0]
+        dropped.update(int(j) for j in dups if j != i)
+    return [cols[i] for i in sorted(keep)]
+ 
+ 
+def make_classifier(seed, level):
+    """Gradient-boosted classifier. Higher levels have fewer positives -> simpler trees."""
+    high = level >= 10
+    if HAS_LGB:
+        return lgb.LGBMClassifier(
+            objective="binary", n_estimators=CFG.N_ESTIMATORS, learning_rate=0.04,
+            num_leaves=7 if high else 15, min_child_samples=40 if high else 60, subsample=0.8, subsample_freq=1,
+            colsample_bytree=0.7, reg_alpha=0.5, reg_lambda=6.0, max_bin=127, n_jobs=CFG.N_JOBS,
+            random_state=seed, verbosity=-1, deterministic=True, force_col_wise=True,
+        )
+    return HistGradientBoostingClassifier(
+        max_iter=min(CFG.N_ESTIMATORS, 160), learning_rate=0.06, max_leaf_nodes=7 if high else 15,
+        min_samples_leaf=40 if high else 60, l2_regularization=6.0, max_bins=127, random_state=seed,
+    )
+ 
+ 
+def select_features(x, cols, first_val_start):
+    """Importance-based pruning using only rows labelled before the first validation day."""
+    cols = drop_correlated(x, cols, CFG.CORR_DROP_THRESHOLD)
+    if len(cols) <= CFG.MAX_FEATURES:
+        return cols
+    tr = x[(x["is_train"] == 1) & (x["mt"] + CFG.LABEL_WINDOW + CFG.HISTORY_LAG <= first_val_start)]
+    if len(tr) < CFG.MIN_TRAIN_ROWS:
+        tr = x[x["is_train"] == 1]
+    X = tr[cols].values.astype(np.float32)
+    imp = np.zeros(len(cols))
+    for level in (3.0, 5.0):
+        y = (tr["max_x"].values >= level).astype(np.uint8)
+        if y.sum() < 20:
+            continue
+        model = make_classifier(CFG.SEED, level)
+        model.fit(X, y)
+        if HAS_LGB:
+            gain = model.booster_.feature_importance(importance_type="gain")
+        else:  # permutation-free proxy for the scikit-learn fallback: univariate rank AUC
+            gain = np.array([abs(_rank_auc(X[:, j], y) - 0.5) for j in range(X.shape[1])])
+        imp += gain / max(gain.sum(), 1e-12)
+    top = np.argsort(-imp)[: CFG.MAX_FEATURES]
+    return [cols[i] for i in sorted(top)]
+ 
+ 
+def _rank_auc(v, y):
+    """Rank-based AUC of one feature against a binary target (NaN-safe)."""
+    from scipy.stats import rankdata
+ 
+    ok = ~np.isnan(v)
+    if ok.sum() < 20 or y[ok].sum() == 0 or y[ok].sum() == ok.sum():
+        return 0.5
+    r = rankdata(v[ok])
+    n1 = y[ok].sum()
+    n0 = ok.sum() - n1
+    return float((r[y[ok] == 1].sum() - n1 * (n1 + 1) / 2) / (n1 * n0))
+ 
+ 
+# %% Exploratory data analysis
+def run_eda(x, cols):
+    """Save diagnostic plots to <output>/eda and log compact statistical findings."""
+    if not HAS_MPL:
+        LOG.warning("matplotlib unavailable; skipping EDA plots")
+        return
+    from scipy.stats import rankdata
+ 
+    out = output_dir() / CFG.EDA_DIRNAME
+    out.mkdir(parents=True, exist_ok=True)
+    tr = x[x["is_train"] == 1].copy()
+    tr["day"] = tr["day"].astype(str)
+    mx, fx = tr["max_x"].values, tr["finalx"].values
+ 
+    # 1. Dataset summary and reach rates
+    levels = (2, 3, 5, 10, 20, 50)
+    rates = {l: float((mx >= l).mean()) for l in levels}
+    LOG.info("EDA | train=%d test=%d days=%d | median final x=%.3f | median max x=%.2f",
+             len(tr), int((x["is_train"] == 0).sum()), tr["day"].nunique(), np.median(fx), np.median(mx))
+    LOG.info("EDA | share reaching level: %s", ", ".join(f"{l}x={r:.3%}" for l, r in rates.items()))
+ 
+    # 2. Buy-everything PnL by take-profit level (why selection is mandatory)
+    grid = np.array([3, 4, 5, 7, 10, 15, 20, 30, 50], dtype=float)
+    buy_all = [float(np.where(mx >= t, t - 1 - CFG.COST, np.maximum(fx - 1 - CFG.COST, -1)).sum()) for t in grid]
+    LOG.info("EDA | buy-everything total PnL by tp: %s", ", ".join(f"{int(t)}:{v:,.0f}" for t, v in zip(grid, buy_all)))
+ 
+    fig, ax = plt.subplots(2, 3, figsize=(17, 9))
+    ax[0, 0].hist(np.log10(np.clip(mx, 1e-3, None)), bins=70, color="#4c72b0")
+    ax[0, 0].set(title="Sustained max multiple (log10)", xlabel="log10(max_x)", ylabel="tokens")
+    ax[0, 1].hist(np.log10(np.clip(fx, 1e-3, None)), bins=70, color="#55a868")
+    ax[0, 1].set(title="Final multiple (log10)", xlabel="log10(finalx)")
+    xs = np.logspace(0, 2, 60)
+    ax[0, 2].loglog(xs, [(mx >= v).mean() + 1e-9 for v in xs], color="#c44e52")
+    ax[0, 2].set(title="Share of tokens reaching a level", xlabel="level (x)", ylabel="share")
+    ax[1, 0].bar([str(int(t)) for t in grid], buy_all, color=["#c44e52" if v < 0 else "#55a868" for v in buy_all])
+    ax[1, 0].set(title="Buy-everything PnL by take-profit", xlabel="tp", ylabel="PnL")
+    daily = tr.groupby("day").agg(n=("mint", "size"), r3=("max_x", lambda s: (s >= 3).mean()), r5=("max_x", lambda s: (s >= 5).mean()))
+    ax[1, 1].plot(daily.index, daily["r3"], label="reach 3x")
+    ax[1, 1].plot(daily.index, daily["r5"], label="reach 5x")
+    ax[1, 1].set(title="Daily reach rate (regime drift)", ylabel="share")
+    ax[1, 1].tick_params(axis="x", rotation=60, labelsize=6)
+    ax[1, 1].legend()
+    hour = pd.to_datetime(tr["mt"], unit="s", utc=True).dt.hour
+    hr = tr.groupby(hour)["max_x"].agg(n="size", r5=lambda s: (s >= 5).mean())
+    ax[1, 2].bar(hr.index, hr["n"], color="#8172b2", alpha=0.6)
+    ax2 = ax[1, 2].twinx()
+    ax2.plot(hr.index, hr["r5"], color="#c44e52")
+    ax[1, 2].set(title="Tokens per UTC hour (bars) and 5x rate (line)", xlabel="hour")
+    fig.tight_layout()
+    fig.savefig(out / "01_target_overview.png", dpi=110)
+    plt.close(fig)
+ 
+    # 3. Feature signal: rank correlation and single-feature AUC against reaching 5x
+    sub = tr.sample(min(CFG.EDA_SAMPLE, len(tr)), random_state=CFG.SEED)
+    y5 = (sub["max_x"].values >= 5).astype(np.uint8)
+    lmx = np.log1p(np.clip(sub["max_x"].values, 0, 100))
+    rows = []
+    for c in cols:
+        v = sub[c].values.astype(np.float64)
+        ok = ~np.isnan(v)
+        if ok.sum() < 200 or np.nanstd(v) == 0:
+            continue
+        rho = np.corrcoef(rankdata(v[ok]), rankdata(lmx[ok]))[0, 1]
+        rows.append((c, rho, _rank_auc(v, y5), 1 - ok.mean()))
+    sig = pd.DataFrame(rows, columns=["feature", "spearman_logmax", "auc_5x", "missing"]).dropna()
+    sig["abs_rho"] = sig["spearman_logmax"].abs()
+    sig = sig.sort_values("abs_rho", ascending=False)
+    LOG.info("EDA | strongest rank correlations with log(max_x):\n%s", sig.head(12)[["feature", "spearman_logmax", "auc_5x"]].round(3).to_string(index=False))
+    sig.to_csv(out / "feature_signal.csv", index=False)
+ 
+    top = sig.head(20)
+    fig, ax = plt.subplots(1, 2, figsize=(16, 7))
+    ax[0].barh(top["feature"][::-1], top["spearman_logmax"][::-1], color=["#c44e52" if v < 0 else "#55a868" for v in top["spearman_logmax"][::-1]])
+    ax[0].set(title="Top features: Spearman with log(max_x)")
+    miss = sig.sort_values("missing", ascending=False).head(20)
+    ax[1].barh(miss["feature"][::-1], miss["missing"][::-1], color="#8172b2")
+    ax[1].set(title="Highest missing share", xlim=(0, 1))
+    fig.tight_layout()
+    fig.savefig(out / "02_feature_signal.png", dpi=110)
+    plt.close(fig)
+ 
+    # 4. Class-conditional distributions of the six strongest features
+    best = list(sig.head(6)["feature"])
+    if best:
+        fig, ax = plt.subplots(2, 3, figsize=(16, 8))
+        for a, c in zip(ax.ravel(), best):
+            v = sub[c].astype(float)
+            lo, hi = np.nanpercentile(v, [1, 99])
+            for lab, color in ((0, "#4c72b0"), (1, "#c44e52")):
+                vv = v[y5 == lab].clip(lo, hi).dropna()
+                if len(vv):
+                    a.hist(vv, bins=40, alpha=0.55, density=True, color=color, label="reach 5x" if lab else "no")
+            a.set_title(c, fontsize=9)
+        ax[0, 0].legend()
+        fig.tight_layout()
+        fig.savefig(out / "03_class_distributions.png", dpi=110)
+        plt.close(fig)
+ 
+    # 5. Redundancy between the strongest features
+    top_c = list(sig.head(20)["feature"])
+    if len(top_c) > 3:
+        cm = sub[top_c].rank(pct=True).corr().values
+        fig, ax = plt.subplots(figsize=(9, 8))
+        im = ax.imshow(cm, vmin=-1, vmax=1, cmap="coolwarm")
+        ax.set_xticks(range(len(top_c)), top_c, rotation=90, fontsize=6)
+        ax.set_yticks(range(len(top_c)), top_c, fontsize=6)
+        fig.colorbar(im)
+        ax.set_title("Spearman correlation of strongest features")
+        fig.tight_layout()
+        fig.savefig(out / "04_feature_correlation.png", dpi=110)
+        plt.close(fig)
+    stage(f"EDA figures written to {out}")
+ 
+ 
+# %% Modelling: 
+def level_labels(max_x, levels=CFG.LEVELS):
+    return {lv: (max_x >= lv).astype(np.uint8) for lv in levels}
+ 
+ 
+def fit_level_models(X, max_x, seed):
+    """One classifier per take-profit level. Returns {level: model or constant probability}."""
+    models = {}
+    labels = level_labels(max_x)
+    for j, lv in enumerate(CFG.LEVELS):
+        y = labels[lv]
+        if y.sum() < 10 or y.sum() == len(y):
+            models[lv] = float(y.mean())  # too few positives for a stable model
+            continue
+        m = make_classifier(seed + j, lv)
+        m.fit(X, y)
+        models[lv] = m
+    return models
+ 
+ 
+def predict_levels(models, X):
+    """Raw probabilities of reaching each level, shape (n, n_levels), forced non-increasing."""
+    p = np.zeros((len(X), len(CFG.LEVELS)), dtype=np.float64)
+    for j, lv in enumerate(CFG.LEVELS):
+        m = models[lv]
+        p[:, j] = m if isinstance(m, float) else m.predict_proba(X)[:, 1]
+    return np.minimum.accumulate(p, axis=1)
+ 
+ 
+def fit_calibrators(p_oof, max_x_oof):
+    """Platt scaling per level on pooled out-of-fold predictions."""
+    cals = []
+    for j, lv in enumerate(CFG.LEVELS):
+        y = (max_x_oof >= lv).astype(np.uint8)
+        if y.sum() < 25 or y.sum() == len(y):
+            cals.append(None)
+            continue
+        z = np.log(np.clip(p_oof[:, j], 1e-5, 1 - 1e-5) / (1 - np.clip(p_oof[:, j], 1e-5, 1 - 1e-5)))[:, None]
+        cals.append(LogisticRegression(C=1.0, max_iter=500).fit(z, y))
+    return cals
+ 
+ 
+def apply_calibrators(cals, p):
+    out = p.copy()
+    for j, cal in enumerate(cals):
+        if cal is None:
+            continue
+        q = np.clip(p[:, j], 1e-5, 1 - 1e-5)
+        out[:, j] = cal.predict_proba(np.log(q / (1 - q))[:, None])[:, 1]
+    return np.minimum.accumulate(out, axis=1)
+ 
+ 
+def held_payoff_by_level(max_x, final_x):
+    """Average payoff when the take-profit does not trigger (position held to the end of the hour)."""
+    held = np.maximum(final_x - 1 - CFG.COST, -1.0)
+    res = []
+    for lv in CFG.LEVELS:
+        miss = max_x < lv
+        res.append(float(held[miss].mean()) if miss.any() else -0.95)
+    return np.array(res)
+ 
+ 
+def expected_value(p, held_miss):
+    levels = np.array(CFG.LEVELS)[None, :]
+    return p * (levels - 1 - CFG.COST) + (1 - p) * held_miss[None, :]
+ 
+ 
+def decide(ev, min_ev):
+    """Best level per token; skip if its expected value is below the margin. Each token is decided alone."""
+    best = np.argmax(ev, axis=1)
+    best_ev = ev[np.arange(len(ev)), best]
+    tp = np.where(best_ev >= min_ev, np.array(CFG.LEVELS)[best], 0.0)
+    return tp
+ 
+ 
+def realised_pnl(tp, max_x, final_x):
+    hit = max_x >= tp
+    pnl = np.where(hit, tp - 1 - CFG.COST, np.maximum(final_x - 1 - CFG.COST, -1.0))
+    return np.where(tp > 0, pnl, 0.0)
+ 
+ 
+def walk_forward(x, cols):
+    """Embargoed walk-forward over the last OOF_DAYS training days. Returns OOF arrays."""
+    tr = x[x["is_train"] == 1].reset_index(drop=True)
+    X = tr[cols].values.astype(np.float32)
+    mt = tr["mt"].values
+    days = tr["day"].astype(str).values
+    udays = sorted(set(days))
+    n_val = int(min(CFG.OOF_DAYS, max(2, len(udays) // 4)))
+    val_days = udays[-n_val:]
+    parts = []
+    for k, vd in enumerate(val_days):
+        if elapsed() > CFG.SKIP_CV_AFTER_SEC:
+            LOG.warning("time guard: stopping validation after %d folds", k)
+            break
+        vi = np.where(days == vd)[0]
+        v_start = int(pd.Timestamp(vd, tz="UTC").timestamp())
+        ti = np.where(mt + CFG.LABEL_WINDOW + CFG.HISTORY_LAG <= v_start)[0]  # embargo: labels must be resolved
+        if len(ti) < CFG.MIN_TRAIN_ROWS or len(vi) == 0:
+            continue
+        models = fit_level_models(X[ti], tr["max_x"].values[ti], CFG.SEED + k)
+        p = predict_levels(models, X[vi])
+        held = held_payoff_by_level(tr["max_x"].values[ti], tr["finalx"].values[ti])
+        parts.append((vi, p, np.tile(held, (len(vi), 1))))
+        stage(f"fold {vd}: train={len(ti)} valid={len(vi)}")
+        del models
+        gc.collect()
+    if not parts:
+        return None
+    idx = np.concatenate([a for a, _, _ in parts])
+    return {
+        "p": np.vstack([b for _, b, _ in parts]),
+        "held": np.vstack([c for _, _, c in parts]),
+        "max_x": tr["max_x"].values[idx],
+        "finalx": tr["finalx"].values[idx],
+        "day": days[idx],
+    }
+ 
+ 
+def tune_policy(oof, cals):
+    """Pick the EV margin that maximises a risk-adjusted daily PnL on out-of-fold data."""
+    p = apply_calibrators(cals, oof["p"])
+    ev = expected_value(p, oof["held"][0])
+    rows = []
+    days = np.array(sorted(set(oof["day"])))
+    for margin in CFG.MIN_EV_GRID:
+        tp = decide(ev, margin)
+        pnl = realised_pnl(tp, oof["max_x"], oof["finalx"])
+        daily = pd.Series(pnl).groupby(oof["day"]).sum().reindex(days, fill_value=0.0)
+        n_tr = int((tp > 0).sum())
+        rows.append((margin, float(pnl.sum()), float(daily.mean()), float(daily.std(ddof=0)), n_tr,
+                     float(daily.mean() - CFG.RISK_AVERSION * daily.std(ddof=0))))
+    tab = pd.DataFrame(rows, columns=["min_ev", "pnl", "daily_mean", "daily_std", "trades", "robust"])
+    LOG.info("Policy search (out-of-fold)\n%s", tab.round(3).to_string(index=False))
+    ok = tab[tab["trades"] >= CFG.MIN_OOF_TRADES]
+    if ok.empty:
+        return CFG.DEFAULT_MIN_EV, tab, False
+    best = ok.sort_values(["robust", "pnl"], ascending=False).iloc[0]
+    positive = bool(best["pnl"] > 0)
+    return float(best["min_ev"]), tab, positive
+ 
+ 
+# %% Final fit and prediction
+def final_predict(x, cols, cals, min_ev):
+    tr = x[x["is_train"] == 1]
+    te = x[x["is_train"] == 0]
+    Xtr = tr[cols].values.astype(np.float32)
+    Xte = te[cols].values.astype(np.float32)
+    held = held_payoff_by_level(tr["max_x"].values, tr["finalx"].values)
+    ps = []
+    for s in CFG.FINAL_SEEDS:
+        models = fit_level_models(Xtr, tr["max_x"].values, CFG.SEED + 1000 + s)
+        ps.append(predict_levels(models, Xte))
+        del models
+        gc.collect()
+    p = apply_calibrators(cals, np.mean(ps, axis=0))
+    ev = expected_value(p, held)
+    tp = decide(ev, min_ev)
+    return pd.Series(tp, index=te["mint"].values), ev
+ 
+ 
+# %% Pipeline
+def run_pipeline():
+    stage(f"start | lightgbm={HAS_LGB} | cpu_jobs={CFG.N_JOBS}")
+    root = find_data_dir()
+    stage(f"data directory: {root}")
+    train, test, sample = load_core_tables(root)
+    stage(f"train={train.shape} test={test.shape} sample={sample.shape}")
+ 
+    out_path = output_dir() / "submission.csv"
+    write_submission(sample, None, out_path)  # safety net: valid all-skip file
+    stage(f"safety submission written: {out_path}")
+ 
+    mints = set(train["mint"]) | set(test["mint"])
+    creation = migrations = None
+    try:
+        creation = read_csv_safe(root / "pumpfun_token_creation.csv", CREATION_COLS, mints)
+    except Exception as exc:
+        LOG.warning("token creation table unavailable: %s", exc)
+    try:
+        migrations = read_csv_safe(root / "pfamm_migrations.csv", MIGRATION_COLS, mints)
+    except Exception as exc:
+        LOG.warning("migrations table unavailable: %s", exc)
+ 
+    x = build_feature_frame(root, train, test, creation, migrations)
+    del creation, migrations
+    gc.collect()
+    cols = candidate_columns(x)
+    stage(f"feature frame {x.shape}, candidate features {len(cols)}")
+ 
+    if CFG.RUN_EDA and elapsed() < CFG.SKIP_EDA_AFTER_SEC:
+        try:
+            run_eda(x, cols)
+        except Exception as exc:
+            LOG.warning("EDA skipped: %s", exc)
+ 
+    udays = sorted(x.loc[x["is_train"] == 1, "day"].astype(str).unique())
+    n_val = int(min(CFG.OOF_DAYS, max(2, len(udays) // 4)))
+    first_val_start = int(pd.Timestamp(udays[-n_val], tz="UTC").timestamp())
+    cols = select_features(x, cols, first_val_start)
+    stage(f"selected features: {len(cols)}")
+ 
+    cals = [None] * len(CFG.LEVELS)
+    min_ev, positive = CFG.DEFAULT_MIN_EV, True
+    if elapsed() < CFG.SKIP_CV_AFTER_SEC:
+        try:
+            oof = walk_forward(x, cols)
+            if oof is not None:
+                cals = fit_calibrators(oof["p"], oof["max_x"])
+                min_ev, tab, positive = tune_policy(oof, cals)
+                stage(f"chosen min_ev={min_ev} | positive out-of-fold PnL={positive}")
+        except Exception as exc:
+            LOG.warning("validation failed, using default policy: %s\n%s", exc, traceback.format_exc())
+    else:
+        LOG.warning("time guard: validation skipped, using default policy")
+ 
+    if not positive and not CFG.ALLOW_NEGATIVE_OOF_POLICY:
+        LOG.warning("no out-of-fold edge found; submitting skip-all (zero PnL by definition)")
+        return sample, pd.Series(dtype=float)
+ 
+    tp, _ = final_predict(x, cols, cals, min_ev)
+    stage(f"trades on test: {(tp > 0).sum()} of {len(tp)} | level counts: {tp[tp > 0].value_counts().sort_index().to_dict()}")
+    return sample, tp
+ 
+ 
+def main():
+    out_path = output_dir() / "submission.csv"
+    sample = None
+    try:
+        sample, tp = run_pipeline()
+        write_submission(sample, tp.to_dict() if len(tp) else None, out_path)
+        stage(f"final submission written and validated: {out_path}")
+    except Exception as exc:
+        LOG.error("pipeline failed: %s\n%s", exc, traceback.format_exc())
+        # Keep the safety submission if it already exists; otherwise build one from test/sample.
+        if not out_path.exists():
+            try:
+                root = find_data_dir()
+                _, test, sample = load_core_tables(root)
+                write_submission(sample, None, out_path)
+            except Exception as exc2:
+                LOG.error("could not write fallback submission: %s", exc2)
+                raise
+    return 0
+ 
+ 
+if __name__ == "__main__":
+    main()
+ 

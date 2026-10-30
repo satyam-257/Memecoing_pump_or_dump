@@ -1,0 +1,15 @@
+{
+  "id": "satyamkumar0725/solana-memecoins-pump-or-dump-cascade",
+  "title": "Solana Memecoins Pump or Dump Cascade",
+  "code_file": "submission_pipeline.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": "true",
+  "enable_gpu": "false",
+  "enable_internet": "false",
+  "dataset_sources": [],
+  "competition_sources": [
+    "memecoins-pump-or-dump"
+  ],
+  "kernel_sources": []
+}

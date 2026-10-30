@@ -1,0 +1,330 @@
+markdown:
+# 2 · Full feature model
+
+The heavy version. Notebook 1 used five numbers that were already in the CSVs; this one reads
+the tape — every curve trade and the first sixty seconds on the pool — and builds the whole
+stack:
+
+* **twenty tape features** per token, each one a sentence of market structure (depth, who is
+  buying, whether money is still arriving, where the price sits when you decide);
+* **twenty launch features** from the creation transaction (bundle, deployer's share, tooling
+  fingerprint);
+* **wallet reputation** — which early buyers have been early on winners before — built under
+  the one-hour resolution rule so that it is a legal feature and not a leak;
+* a **two-stage cascade**: first exclude what is going to die, then rank what is left.
+
+And the same honest protocol as everywhere else in this series: one fold per training day,
+embargoed, judged by the competition's own PnL. Nothing here is above the line by a wide
+margin, and the last section says so. It is a map of where the signal is, not a recipe.
+---
+code:
+import os, glob, gc, re, time, warnings
+import numpy as np, pandas as pd
+import lightgbm as lgb
+import matplotlib.pyplot as plt
+warnings.filterwarnings('ignore')
+
+COST, WIN, EMBARGO, K = 0.3, 3600, 3600, 5
+DATA = next(p for p in ['/kaggle/input/competitions/memecoins-pump-or-dump', 'data'] if os.path.exists(p))
+train = pd.read_csv(f'{DATA}/train.csv'); test = pd.read_csv(f'{DATA}/test.csv')
+train = train.rename(columns={'finalx': 'final_x'})            # older files used this name
+for _d in (train, test):                                           # day = UTC day of the migration time
+    _d['day'] = pd.to_datetime(_d.mt, unit='s').dt.strftime('%Y-%m-%d')
+
+def pnl(tp, max_x, final_x, cost=COST):
+    tp = np.asarray(tp, float)
+    hit  = (max_x >= tp) & (tp > 0)
+    held = np.maximum(final_x - 1 - cost, -1.0)
+    return np.where(tp <= 0, 0.0, np.where(hit, tp - 1 - cost, held))
+
+CURVE_COLS = ['failed', 'mint', 'ts_rel', 'tx_idx', 'direction', 'sol', 'new_price', 'wallet']
+AMM_COLS   = ['mint', 'ts_rel', 'tx_idx', 'direction', 'sol', 'new_price', 'signing_wallet']
+if os.path.exists(f'{DATA}/trades'):
+    DAYS = [(d.split('=')[-1], f'{d}/pumpfun_all_swaps.parquet', f'{d}/pumpswap_all_swaps.parquet')
+            for d in sorted(glob.glob(f'{DATA}/trades/day=*'))]
+else:
+    DAYS = [(os.path.basename(f)[4:14], f, f.replace('pumpfun_all_swaps', 'pumpswap_all_swaps'))
+            for f in sorted(glob.glob(f'{DATA}/day_*_pumpfun_all_swaps.parquet'))]
+print(f'{len(DAYS)} days of tape | train {len(train)} | test {len(test)}')
+---
+markdown:
+## Tape features
+
+Read one day at a time, only the columns needed. The curve tape also contains reverted
+transactions (`failed = 1`, zero amounts) — they are dropped for every price or volume number
+and counted separately as `curve_failed`, because a curve where half the buys bounced is a
+crowded one, and that is information too.
+---
+code:
+def tape_features(c, a):
+    for df in (c, a):
+        df['is_buy'] = df.direction.astype(str).str.upper().str.startswith('B').astype(np.int8)
+        df['price']  = df.new_price          # pool price from reserves after the trade — never sol/tok of the trade
+    a = a.sort_values('mint', kind='stable'); g = a.groupby('mint')      # rows arrive in chain order (slot, transaction, swap) — keep it, never re-sort by the second
+    F = pd.DataFrame(index=g.size().index)
+    # volume and participation in the first minute
+    F['amm_n'] = g.size(); F['amm_sol'] = g.sol.sum(); F['amm_uw'] = g.wallet.nunique()
+    F['trades_per_wallet'] = F.amm_n / F.amm_uw.replace(0, np.nan)
+    ws = a.groupby(['mint', 'wallet']).sol.sum()
+    F['amm_top1'] = ws.groupby('mint').max() / ws.groupby('mint').sum().replace(0, np.nan)
+    # is money still arriving when you decide?
+    late, early = a[a.ts_rel >= 45], a[a.ts_rel < 15]
+    F['late_sol'] = late.groupby('mint').sol.sum()
+    F['late_over_early'] = F.late_sol / early.groupby('mint').sol.sum().replace(0, np.nan)
+    F['late_buyshare'] = late[late.is_buy == 1].groupby('mint').sol.sum() / F.late_sol.replace(0, np.nan)
+    tail = a[a.ts_rel > 30]
+    F['tail_buyshare'] = tail[tail.is_buy == 1].groupby('mint').sol.sum() / tail.groupby('mint').sol.sum().replace(0, np.nan)
+    seen = early.groupby('mint').wallet.apply(set); lateW = late.groupby('mint').wallet.apply(set)
+    F['fresh_wallets'] = pd.Series({m: len(s - seen.get(m, set())) for m, s in lateW.items()})
+    # who is leaving: early buyers that already sold within the minute
+    buyers = a[(a.ts_rel <= 15) & (a.is_buy == 1)].groupby('mint').wallet.apply(set)
+    sellers = a[a.is_buy == 0].groupby('mint').wallet.apply(set)
+    F['flip_rate'] = pd.Series({m: len(s & sellers.get(m, set())) / max(len(s), 1) for m, s in buyers.items()})
+    buys = a[a.is_buy == 1]
+    F['buy_max'] = buys.groupby('mint').sol.max()
+    F['whale_buys'] = buys[buys.sol >= 5].groupby('mint').size().reindex(F.index).fillna(0)
+    # price path inside the window
+    F['p_first'] = g.price.first(); F['p_last'] = g.price.last(); F['p_max'] = g.price.max()
+    F['ret60'] = F.p_last / F.p_first.replace(0, np.nan)
+    F['runup'] = F.p_max / F.p_first.replace(0, np.nan)
+    F['at_high'] = F.p_last / F.p_max.replace(0, np.nan)
+    F['vol'] = a.assign(lp=np.log(a.price.replace(0, np.nan))).groupby('mint').lp.std()
+    aa = a[a.price > 0].copy()
+    aa['dlp'] = aa.groupby('mint').price.transform(lambda s: np.log(s).diff())
+    aa['signed'] = np.where(aa.is_buy == 1, aa.sol, -aa.sol)
+    aa = aa.dropna(subset=['dlp'])
+    F['impact_per_sol'] = ((aa.signed * aa.dlp).groupby(aa.mint).sum()
+                           / (aa.signed ** 2).groupby(aa.mint).sum().replace(0, np.nan))
+    # the curve phase
+    ok = c[c.failed == 0]
+    F['curve_sol'] = ok.groupby('mint').sol.sum()
+    F['curve_uw'] = ok.groupby('mint').wallet.nunique()
+    F['curve_dur'] = -ok.groupby('mint').ts_rel.first()
+    F['curve_failed'] = c[c.failed != 0].groupby('mint').size().reindex(F.index).fillna(0)
+    F['migration_pop'] = F.p_first / ok.groupby('mint').price.last().replace(0, np.nan)
+    return F.drop(columns=['p_first', 'p_last', 'p_max'])
+
+t0 = time.time(); frames = []
+for i, (day, cp, ap) in enumerate(DAYS, 1):
+    c = pd.read_parquet(cp, columns=CURVE_COLS)
+    a = pd.read_parquet(ap, columns=AMM_COLS).rename(columns={'signing_wallet': 'wallet'})
+    frames.append(tape_features(c, a).reset_index().rename(columns={'index': 'mint'}))
+    del c, a; gc.collect()
+    if i % 10 == 0 or i == len(DAYS): print(f'  tape {i}/{len(DAYS)} ({time.time()-t0:.0f}s)', flush=True)
+TAPE = pd.concat(frames, ignore_index=True)
+---
+markdown:
+## Launch features
+
+Everything that was true before the token ever traded: how the creation transaction was built,
+how much rode along in the bundle, what the deployer kept, the shape of the name. Slot and
+creation time are deliberately left out — they encode the calendar, not the launch.
+---
+code:
+cre = pd.read_csv(f'{DATA}/pumpfun_token_creation.csv').drop_duplicates('mint')
+name = cre.name.fillna('').astype(str); sym = cre.symbol.fillna('').astype(str)
+bs = cre.bundle_structure.fillna('').astype(str)
+M = pd.DataFrame({'mint': cre.mint})
+M['name_len'] = name.str.len(); M['symbol_len'] = sym.str.len()
+M['name_upper'] = name.apply(lambda s: sum(ch.isupper() for ch in s) / max(len(s), 1))
+M['name_eq_symbol'] = (name.str.lower().str[:4] == sym.str.lower().str[:4]).astype(int)
+M['bs_ops'] = bs.str.split().str.len(); M['bs_len'] = bs.str.len()
+M['bs_buys'] = bs.apply(lambda s: len(re.findall(r'\dB\d', s)))
+amt = bs.apply(lambda s: [int(x) for x in re.findall(r':(\d{6,})', s)])
+M['bs_amt_sum'] = amt.apply(lambda v: float(np.sum(v)) if v else 0.0)
+M['bs_amt_max'] = amt.apply(lambda v: float(np.max(v)) if v else 0.0)
+for c_ in ['gas_used', 'amount_of_instructions', 'amount_of_lookup_reads', 'amount_of_lookup_writes',
+           'creation_ix_index', 'pf_program_index', 'direct_pf_invocation', 'is_cashback_enabled',
+           'bundle_size', 'bundled_buys', 'bundled_buys_count', 'dev_balance']:
+    if c_ in cre.columns: M[c_] = pd.to_numeric(cre[c_], errors='coerce').values
+M['token2022'] = (~cre.token_program.fillna('').astype(str).str.startswith('Tokenkeg')).astype(int)
+M['created_ts'] = cre.created_ts.values
+
+def prep(df):
+    d = df.merge(TAPE, on='mint', how='left').merge(M, on='mint', how='left')
+    d['age_s'] = d.mt - d.created_ts
+    return d.sort_values('mt', kind='stable').reset_index(drop=True)      # stable: same-second tokens keep their order
+TR, TE = prep(train), prep(test)
+FE = [c for c in list(TAPE.columns) + list(M.columns) if c not in ('mint', 'created_ts')] + ['age_s']
+print(f'{len(FE)} features | train {len(TR)} | test {len(TE)}')
+---
+markdown:
+## Wallet reputation, built legally
+
+Some wallets are consistently early on tokens that run. Their history is a legitimate feature
+— but only the part that had *resolved* when your token migrated. A token that migrated twenty
+minutes before yours has not finished its hour, so its outcome does not exist yet. The loop
+below walks tokens in time order and commits a token's outcome into the wallet counters only
+once that token is an hour old. Build it without that lag and you have a leak that scores
+brilliantly here and dies in the league.
+---
+code:
+AMM_MIN = ['mint', 'ts_rel', 'direction', 'sol', 'signing_wallet']
+t0 = time.time(); edges = []
+for _, _, ap in DAYS:
+    a = pd.read_parquet(ap, columns=AMM_MIN).rename(columns={'signing_wallet': 'wallet'})
+    a = a[a.direction.astype(str).str.upper().str.startswith('B') & (a.ts_rel <= 60)]
+    edges.append(a.groupby(['mint', 'wallet'], as_index=False).sol.sum())
+    del a; gc.collect()
+E = pd.concat(edges, ignore_index=True)
+print(f'{len(E):,} (token, wallet) edges, {E.wallet.nunique():,} wallets ({time.time()-t0:.0f}s)')
+
+tok = pd.concat([train[['mint', 'mt', 'max_x']], test[['mint', 'mt']].assign(max_x=np.nan)],
+                ignore_index=True).sort_values('mt', kind='stable').reset_index(drop=True)
+E['wid'] = E.wallet.astype('category').cat.codes.astype(np.int64)
+by_mint = {m: (g.wid.values, g.sol.values) for m, g in E.sort_values('mint', kind='stable').groupby('mint', sort=False)}
+nW = int(E.wid.max()) + 1
+appear = np.zeros(nW, np.int32); hit = np.zeros(nW, np.int32)
+mts, mxs, mints = tok.mt.values, tok.max_x.values, tok.mint.values
+REPF = ['w_known', 'w_hit_max', 'w_hit_mean', 'w_hit_top3', 'w_elite_n', 'w_elite_share']
+out = np.full((len(tok), len(REPF)), np.nan); j = 0
+for i in range(len(tok)):
+    while j < len(tok) and mts[j] <= mts[i] - WIN:          # commit only tokens that have resolved
+        if not np.isnan(mxs[j]):
+            w = by_mint.get(mints[j])
+            if w is not None:
+                np.add.at(appear, w[0], 1)
+                if mxs[j] >= K: np.add.at(hit, w[0], 1)
+        j += 1
+    w = by_mint.get(mints[i])
+    if w is None: continue
+    wid, sol = w; ap = appear[wid]; known = ap >= 3
+    if known.sum() == 0:
+        out[i] = [0, 0, 0, 0, 0, 0]; continue
+    rate = hit[wid][known] / ap[known]
+    elite = (ap >= 5) & (hit[wid] >= 1)
+    out[i] = [int(known.sum()), float(rate.max()), float(rate.mean()),
+              float(np.sort(rate)[-3:].mean()), int(elite.sum()),
+              float(sol[elite].sum() / max(sol.sum(), 1e-9))]
+REP = pd.DataFrame(out, columns=REPF); REP['mint'] = mints
+TR = TR.merge(REP, on='mint', how='left'); TE = TE.merge(REP, on='mint', how='left')
+ALL = FE + REPF
+print(f'{len(FE)} base features + {len(REPF)} reputation features')
+---
+markdown:
+## The protocol
+
+One fold per day over the last sixteen training days. Training data for a fold is every earlier
+token whose hour had ended an hour before the fold's day began. The policy decides **each token on
+its own**: buy at `tp = 5` if the model's score clears a threshold. The threshold is fixed before
+the day starts — it is the score that the top *q* percent of the last five training days cleared,
+measured with a model that had not seen those days. Nothing about the other tokens of the day
+enters a decision: remove any row from `test.csv` and every other `tp` stays the same. (Ranking the
+test day and buying its top slice would be simpler, and it is not a real-time rule — when an early
+token migrates, the later ones do not exist yet.) Four depths, because the depth is the single
+most important choice in this competition and it has to be shown, not tuned in secret.
+---
+code:
+LGB = dict(n_estimators=400, learning_rate=0.05, num_leaves=31, min_child_samples=40,
+           subsample=0.8, subsample_freq=1, colsample_bytree=0.7, verbose=-1, n_jobs=4)
+SEEDS = [0, 1, 2, 3, 4]
+days = sorted(TR.day.unique()); START = max(10, len(days) - 16)
+
+HOLD = 5          # training days held back to set the buy threshold
+
+def thresholds(predict, trn, qs):
+    """Score levels cleared by the top q percent of tokens on the last HOLD training days, scored by a
+    model fitted on the days before them. Fixed from training data only."""
+    d = sorted(trn.day.unique())
+    cal = trn[trn.day >= d[-HOLD]].reset_index(drop=True)
+    old = trn[(trn.day < d[-HOLD]) & (trn.mt <= cal.mt.min() - WIN - EMBARGO)]
+    p = np.asarray(predict(old, cal))
+    return {q: float(np.quantile(p, 1 - q / 100)) for q in qs}
+
+def walk(predict, qs=(0.5, 1, 2, 5)):
+    rows = []
+    for day in days[START:]:
+        val = TR[TR.day == day]
+        trn = TR[(TR.day < day) & (TR.mt <= val.mt.min() - WIN - EMBARGO)]
+        if len(trn) < 1500 or len(val) < 50 or trn.day.nunique() <= HOLD + 5: continue
+        v = val.reset_index(drop=True)
+        thr = thresholds(predict, trn, qs)
+        p = np.asarray(predict(trn, v))
+        for q in qs:
+            buy = p >= thr[q]                       # per-token decision against a fixed threshold
+            tp = np.where(buy, K, 0.0)
+            rows.append(dict(day=day, q=q, n=int(buy.sum()), hits=int((v.max_x.values[buy] >= K).sum()),
+                             score=float(pnl(tp, v.max_x.values, v.final_x.values).sum())))
+    return pd.DataFrame(rows)
+
+def report(R, label):
+    print(f'\n=== {label} ===')
+    for q, g in R.groupby('q'):
+        print(f'  depth {q:>4}% | {g.n.mean():5.1f}/day | precision {100*g.hits.sum()/max(g.n.sum(),1):5.2f}% '
+              f'| total {g.score.sum():+7.1f} | green {int((g.score>0).sum())}/{len(g)}')
+    return R
+
+def binary(cols_):
+    def f(trn, val):
+        y = (trn.max_x.values >= K).astype(int)
+        return np.mean([lgb.LGBMClassifier(random_state=s, **LGB).fit(trn[cols_].astype(float), y)
+                        .predict_proba(val[cols_].astype(float))[:, 1] for s in SEEDS], axis=0)
+    return f
+
+def cascade(cols_, kill=1.5):
+    """Stage one: will it stay alive (max_x ≥ 1.5)? Stage two, on survivors: will it reach 5x?"""
+    def f(trn, val):
+        X, Xv = trn[cols_].astype(float), val[cols_].astype(float)
+        alive = trn.max_x.values >= kill
+        p_alive = np.mean([lgb.LGBMClassifier(random_state=s, **LGB).fit(X, alive.astype(int))
+                           .predict_proba(Xv)[:, 1] for s in SEEDS], axis=0)
+        if alive.sum() < 500: return p_alive
+        y2 = (trn.max_x.values[alive] >= K).astype(int)
+        p2 = np.mean([lgb.LGBMClassifier(random_state=s, **LGB).fit(X[alive], y2)
+                      .predict_proba(Xv)[:, 1] for s in SEEDS], axis=0)
+        return p_alive * p2
+    return f
+
+R1 = report(walk(binary(FE)),    'tape + launch features, binary target')
+R2 = report(walk(binary(ALL)),   '+ wallet reputation')
+R3 = report(walk(cascade(ALL)),  '+ reputation, two-stage cascade')
+---
+code:
+fig, ax = plt.subplots(figsize=(10, 3.4), dpi=130)
+for R, lab in [(R1, 'features'), (R2, '+ reputation'), (R3, '+ cascade')]:
+    g = R[R.q == 1.0].sort_values('day')
+    ax.plot(g.day, g.score.cumsum(), marker='o', ms=3, lw=1.5, label=lab)
+ax.axhline(0, color='#5f5e56', lw=1, ls='--')
+ax.set_ylabel('cumulative PnL, depth 1%'); ax.legend(fontsize=8); ax.grid(alpha=.25)
+ax.tick_params(axis='x', labelrotation=45, labelsize=7)
+plt.title('walk-forward, one fold per day — the line to beat is zero', fontsize=10)
+plt.tight_layout(); plt.show()
+---
+markdown:
+## What this stack is and is not
+
+**Reputation is the clear gain.** Six columns describing who was buying lift precision at the two
+tightest depths by several points and multiply the total; that is the one effect in this notebook
+larger than the noise. **The cascade is not.** Stacking the exclusion stage on top of the same
+features lands within seed spread of the plain classifier — sometimes above it, sometimes below,
+depending on the seed and the fold set. It is kept because the *shape* (exclude first, then score)
+is the right one and because the submission below uses it; do not read the last two tables as an
+ordering.
+
+**The depth is nominal.** The threshold is set on the last five training days and then applied to
+a day the model has not seen, so the number of buys per day floats — some days twice the nominal
+share, some days none. That is what a per-token rule looks like, and it is the price of not
+peeking at the rest of the day.
+
+**None of it is far above the line.** Break-even precision at `tp = 5` is about 17%. The best
+rows sit in the low-to-mid twenties at the tightest depths, on sixteen days and a few dozen
+trades, with confidence intervals several points wide. A different random seed can reorder
+these three configurations. Treat the table as a map of where the signal appears to be.
+
+**The honest next step is not to tune it.** It is to send it to the league and watch whether the
+ordering survives on days that have not happened yet. The pieces with the most room left are the
+reputation (weight wallets by size and recency, shrink small samples toward the base rate) and
+the exit — `tp = 5` for every token is a placeholder, and the Evaluation page explains why the
+level matters as much as the choice of token.
+---
+markdown:
+## Submission
+---
+code:
+Q = 1.0
+model = cascade(ALL)
+thr = thresholds(model, TR, (Q,))[Q]              # fixed from training before test is scored
+p_te = np.asarray(model(TR, TE))
+tp = np.where(p_te >= thr, K, 0.0)                # each test token decided on its own
+pd.DataFrame({'mint': TE.mint, 'tp': tp}).to_csv('submission.csv', index=False)
+print(f'submission.csv: {len(tp)} rows, buying {int((tp > 0).sum())} at tp={K}')

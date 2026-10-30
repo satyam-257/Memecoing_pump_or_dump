@@ -1,0 +1,161 @@
+markdown:
+# 1 · Minimal submission
+
+The shortest path from the data to a valid `submission.csv` written by a model.
+
+What it does, in one breath: read the token list, count three things per token on the tapes, add
+three numbers from the launch record, fit one small model to *"did this token reach 5x within the hour"*,
+and on the test day buy every token whose score clears a threshold, with a sell target of 5x.
+The threshold is fixed from training data before the test day is looked at, so each token is
+decided on its own. Everything else in the competition is a refinement of some line below.
+
+Two things it also does, because they are not optional:
+
+* it **checks itself honestly** — one fold per day on the last week of training, each fold
+  trained only on tokens whose outcome was already known an hour before that day started;
+* it **writes the file in the exact shape the scorer expects** — one row per test token,
+  `tp = 0` for everything it skips.
+---
+code:
+import os, numpy as np, pandas as pd, lightgbm as lgb
+
+DATA = next(p for p in ['/kaggle/input/competitions/memecoins-pump-or-dump', 'data'] if os.path.exists(p))
+train = pd.read_csv(f'{DATA}/train.csv')
+test  = pd.read_csv(f'{DATA}/test.csv')
+cre   = pd.read_csv(f'{DATA}/pumpfun_token_creation.csv',
+                    usecols=['mint', 'created_ts', 'dev_balance', 'bundled_buys', 'bundle_size']).drop_duplicates('mint')
+train = train.rename(columns={'finalx': 'final_x'})            # older files used this name
+for _d in (train, test):                                           # day = UTC day of the migration time
+    _d['day'] = pd.to_datetime(_d.mt, unit='s').dt.strftime('%Y-%m-%d')
+print(f'train {len(train)} tokens over {train.day.nunique()} days · test {len(test)} tokens on {test.day.iloc[0]}')
+---
+markdown:
+## The score, in four lines
+
+You submit one number per token, `tp`. If the token's *sustained* maximum within the hour
+(`max_x`) reaches `tp`, you earn `tp − 1 − 0.3` (the 0.3 is round-trip cost). If it does not, you
+hold to the end of the hour and get `final_x − 1 − 0.3`, floored at losing the whole stake.
+`tp = 0` means you did not buy, and scores exactly zero.
+---
+code:
+COST, K = 0.3, 5.0
+
+def pnl(tp, max_x, final_x):
+    tp = np.asarray(tp, float)
+    hit  = (max_x >= tp) & (tp > 0)
+    held = np.maximum(final_x - 1 - COST, -1.0)
+    return np.where(tp <= 0, 0.0, np.where(hit, tp - 1 - COST, held))
+---
+markdown:
+## Six features that cost almost nothing
+
+`train.csv` and `test.csv` hold only the token list — `mint`, the migration time `mt`, and for
+train the answers. Everything else comes from the tapes and the launch record. The cheapest
+possible use of the tapes is to count rows:
+
+| feature | meaning |
+|---|---|
+| `n_curve` | executed bonding-curve trades — how much attention the token had before migration |
+| `n_failed` | reverted curve transactions — crowding, bots colliding |
+| `n_pool` | pool trades in the first sixty seconds after migration |
+| `age_s` | seconds from creation to migration — a curve filled in a minute vs. over a day |
+| `dev_balance` | SOL in the deployer's wallet just before the creation transaction (lamports) |
+| `bundled_buys` | how much was bought inside the launch bundle, before anyone else could |
+---
+code:
+def tape(day, table):
+    """Path of one day's tape — folders locally, flat file names on Kaggle."""
+    for path in (f'{DATA}/trades/day={day}/{table}.parquet', f'{DATA}/day_{day}_{table}.parquet'):
+        if os.path.exists(path): return path
+
+parts = []
+for day in sorted(set(train.day) | set(test.day)):          # one day at a time, only the columns needed
+    c = pd.read_parquet(tape(day, 'pumpfun_all_swaps'), columns=['mint', 'failed'])
+    a = pd.read_parquet(tape(day, 'pumpswap_all_swaps'), columns=['mint'])
+    parts.append(pd.DataFrame({'n_curve': c[c.failed == 0].groupby('mint').size(),      # failed = 1 rows are reverted attempts
+                               'n_failed': c[c.failed != 0].groupby('mint').size(),
+                               'n_pool': a.groupby('mint').size()}))
+CNT = pd.concat(parts).fillna(0).rename_axis('mint').reset_index()
+---
+code:
+def prep(df):
+    d = df.merge(cre, on='mint', how='left').merge(CNT, on='mint', how='left')
+    d['age_s'] = d.mt - d.created_ts
+    return d.sort_values('mt', kind='stable').reset_index(drop=True)      # stable: same-second tokens keep their order
+
+FE = ['n_curve', 'n_failed', 'n_pool', 'age_s', 'dev_balance', 'bundled_buys']
+TR, TE = prep(train), prep(test)
+
+LGB = dict(n_estimators=300, learning_rate=0.05, num_leaves=15, min_child_samples=50, verbose=-1, n_jobs=4)
+
+def fit_predict(trn, val):
+    y = (trn.max_x.values >= K).astype(int)
+    return lgb.LGBMClassifier(**LGB).fit(trn[FE].astype(float), y).predict_proba(val[FE].astype(float))[:, 1]
+
+WIN, EMBARGO, HOLD = 3600, 3600, 5
+
+def buy_threshold(trn, q=1.0):
+    """The score level that the top q percent of tokens cleared on the last HOLD training days,
+    measured with a model that had not seen those days. It is fixed before the test day is touched."""
+    d = sorted(trn.day.unique())
+    cal = trn[trn.day >= d[-HOLD]]
+    old = trn[(trn.day < d[-HOLD]) & (trn.mt <= cal.mt.min() - WIN - EMBARGO)]
+    return float(np.quantile(fit_predict(old, cal), 1 - q / 100))
+
+def decide(p, thr):
+    """One token, one decision: tp = K if its own score clears the threshold, otherwise skip.
+    Nothing about the other tokens of the day enters — drop any row of test.csv and the rest stay put."""
+    return np.where(np.asarray(p) >= thr, K, 0.0)
+---
+markdown:
+## Honest check: the last seven training days, one at a time
+
+For each day: train on every earlier token whose outcome was already resolved an hour before
+the day began (`mt ≤ day_start − 3600 − 3600`), set the buy threshold from those training days
+(about one percent of tokens clear it), then decide that day's tokens one by one.
+This is the same shape as the real test — a day the model has never seen — so the numbers
+below are the ones to believe, not anything measured on a random split.
+---
+code:
+days = sorted(TR.day.unique())
+rows = []
+for day in days[-7:]:
+    val = TR[TR.day == day].reset_index(drop=True)
+    trn = TR[(TR.day < day) & (TR.mt <= val.mt.min() - WIN - EMBARGO)]
+    tp = decide(fit_predict(trn, val), buy_threshold(trn))
+    s = pnl(tp, val.max_x.values, val.final_x.values)
+    rows.append(dict(day=day, tokens=len(val), taken=int((tp > 0).sum()),
+                     hits=int((val.max_x.values[tp > 0] >= K).sum()), pnl=round(float(s.sum()), 2)))
+WF = pd.DataFrame(rows)
+print(WF.to_string(index=False))
+print(f'\ntotal {WF.pnl.sum():+.2f} over {len(WF)} days · {int((WF.pnl > 0).sum())} positive days · '
+      f'hit rate {100 * WF.hits.sum() / max(WF.taken.sum(), 1):.1f}% (break-even at tp=5 needs ~17%)')
+---
+markdown:
+Read that table before reading anything else. A few trades a day, most of them losing 1.3, a
+few winning 3.7 — the sign of a week can flip on one token. Anything you build on top of this
+has to be judged the same way: day by day, on days it has not seen, against the line
+`tp = 0 → score 0`.
+---
+markdown:
+## The submission
+
+Fit on all of training, fix the threshold from training, decide each test token, write the file.
+---
+code:
+tp = decide(fit_predict(TR, TE), buy_threshold(TR))
+sub = pd.DataFrame({'mint': TE.mint, 'tp': tp})
+sub.to_csv('submission.csv', index=False)
+print(f'submission.csv: {len(sub)} rows, {int((tp > 0).sum())} tokens bought at tp={K:.0f}, the rest 0')
+print(sub[sub.tp > 0].head())
+---
+markdown:
+## Where to go from here
+
+* **Read the tape.** The two parquet files per day hold every trade of the curve phase and the
+  first sixty seconds on the pool. Notebook 3 shows what in them separates the tokens that ran
+  from the tokens that died; notebook 2 turns that into a full model.
+* **Choose the exit.** `tp = 5` for everyone is a placeholder. The Evaluation page explains why
+  the level matters as much as the choice of token.
+* **Send it to the bot.** Kaggle scores one day; the league re-runs this notebook on every new
+  day and that is where the standings come from. The Overview page has the details.

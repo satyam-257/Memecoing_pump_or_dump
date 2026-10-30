@@ -1,0 +1,1 @@
+# Runs the 16-day walk-forward protocol across 10 random seeds (not 5) and prints three numbers: Mean Total PnL, Worst-Seed PnL, and Green Days (out of 16). Antigravity is only allowed to call this script, never edit it.
