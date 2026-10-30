@@ -1,4 +1,4 @@
-"""Generates the upgraded Two-Stage Decoupled Gatekeeper competition notebook for Kaggle execution."""
+"""Generates the upgraded Decoupled Two-Stage Gatekeeper competition notebook for Kaggle execution."""
 import os
 import nbformat as nbf
 
@@ -23,28 +23,24 @@ cells.append(nbf.v4.new_markdown_cell("""# Decoupled Two-Stage Gatekeeper & Mult
 
 ---
 
-## Research Abstract & Quantitative Architecture
+## Quantitative Architecture & 30-Day Rolling Sandbox Requirements
 
-This notebook implements a decoupled two-stage quantitative decision system for newly migrated Solana memecoin pools (Pump.fun to PumpSwap AMM). At exactly $t = 60\\text{s}$ post-migration, the system evaluates high-frequency microstructure and participant reputation to determine whether to enter a long position and dynamically select an optimal take-profit target $tp \\in [3, 100]$ over a 1-hour holding window, or skip at zero cost ($tp = 0$).
+This notebook implements an offline-safe, decoupled two-stage quantitative decision engine for newly migrated Solana memecoins on PumpSwap AMM. At exactly $t = 60\\text{s}$ post-migration, the system evaluates high-frequency order book microstructure and participant reputation to determine whether to enter a long position and dynamically select an optimal take-profit target $tp \\in \\{4, 5, 6, 8, 12, 20, 100\\}$ over a 1-hour holding window, or skip at zero cost ($tp = 0$).
 
-### Core Quantitative Pillars:
-1. **Stage 1: Precision Gatekeeper (Rug-Pull & Failure Filter)**:
-   - Target: $P(\\max(X) \\ge 3.0)$
-   - Out-of-fold probability calibration via Platt scaling (logistic regression on holdout logits).
-   - High conviction hurdle $\\tau$ isolating only 2-3 highest-conviction daily opportunities, bypassing the $-0.30$ SOL transaction drain.
-2. **Stage 2: Quantile / Expected Utility Optimizer**:
-   - Rather than predicting raw peak price, evaluates the expected payoff curve directly across discrete grid $K = (3, 4, 5, 7, 10, 15)$:
-     $$\\mathbb{E}[\\text{PnL}(k)] = P(\\max(X) \\ge k) \\cdot (k - 1.30) + (1 - P(\\max(X) \\ge k)) \\cdot \\text{miss\\_payoff}(k)$$
-   - Enforces strict probability monotonicity via `np.minimum.accumulate`.
-   - Allocates $k^* = \\arg\\max_{k \\in K} \\mathbb{E}[\\text{PnL}(k)]$.
-3. **High-Frequency Microstructure & On-Chain Graph Signals**:
-   - Gini concentration of early buy volumes & wash trading indicators (`unique_buyers_ratio`).
-   - Launch block slot sniping share (slots 0-2).
-   - Second-derivative volume acceleration ($d^2 V / dt^2$).
-   - Buy/Sell volume and transaction ratios with fast-flipper dump tracking.
-4. **Causal Creator History & Participant Reputation**:
-   - Strict 1-hour resolution embargo ($mt_j \\le mt_i - 3600$) with zero future leakage.
-   - Deployer historical launch counts, median/max peak multiples, and $3\\times/5\\times$ hit rates.
+### Core Upgrades & Safeguards:
+1. **Wallet Reputation with Empirical Bayesian Shrinkage & 7-Day Decay**:
+   - Strict two-pointer 3600s causal embargo ($mt_j \\le mt_i - 3600$).
+   - Empirical Bayesian Shrinkage ($m$-estimate smoothing, $m = 5$):
+     $$\\text{shrunk\\_rate} = \\frac{\\text{hits} + 5 \\times 0.0607}{\\text{appearances} + 5}$$
+   - SOL trade size weighting and 7-day half-life exponential recency decay ($e^{-\\Delta t \\cdot \\lambda}$) so recent high-volume winners dominate stale micro-trades.
+2. **Decoupled Stage 1 & Stage 2 Feature Subsets**:
+   - **Stage 1 (Gatekeeper / Rug Filter)**: Emphasizes creation bundle metrics, deployer share, Gini volume concentration, and wash-trading ratios to eliminate immediate rugs.
+   - **Stage 2 (Expected PnL Exit Selector)**: Emphasizes shrunk wallet reputation, post-trade reserve pool price velocity ($d^2V/dt^2$), and unique buyer inflow to select $tp \\in \\{4, 5, 6, 8, 12, 20, 100\\}$ ($tp=100$ represents full 1-hour hold for extreme momentum).
+3. **Causal Per-Token Execution (Zero Test Peeking)**:
+   - Does not rank or sort test day predictions.
+   - Fixed scalar cutoff $\\tau^*$ calibrated strictly on the last 5 training days targeting a nominal precision depth of ~2 to 5 trades per day.
+4. **100% Offline Sandbox Execution**:
+   - Zero external network dependencies, RPC calls, or online enrichment scripts. Fully isolated and self-contained for the offline sandbox.
 """))
 
 # Cell 1: Environment Setup & Constants
@@ -53,7 +49,6 @@ import numpy as np
 import pandas as pd
 import lightgbm as lgb
 from sklearn.linear_model import LogisticRegression
-import matplotlib.pyplot as plt
 
 warnings.filterwarnings('ignore')
 
@@ -77,17 +72,25 @@ print(f"Dataset root resolved to: {DATA}")
 
 WSOL = "So11111111111111111111111111111111111111112"
 COST = 0.30
-LEVELS = [3.0, 4.0, 5.0, 7.0, 10.0, 15.0]
+LEVELS = [4.0, 5.0, 6.0, 8.0, 12.0, 20.0, 100.0]
+TARGET_K = 5.0
 WIN = 3600
 EMBARGO = 3600
 HOLD_DAYS = 5
 SEEDS = [42, 101, 2024, 7, 777]
 
-def pnl(tp, max_x, final_x, cost=COST):
-    tp = np.asarray(tp, float)
-    hit = (max_x >= tp) & (tp > 0)
-    held = np.maximum(final_x - 1.0 - cost, -1.0)
-    return np.where(tp <= 0, 0.0, np.where(hit, tp - 1.0 - cost, held))
+HALF_LIFE_SECONDS = 7.0 * 86400.0
+DECAY_LAMBDA = np.log(2.0) / HALF_LIFE_SECONDS
+GLOBAL_BASE_RATE = 0.0607
+M_SHRINKAGE = 5.0
+
+def evaluate_pnl(y_true_max, y_true_end, y_pred_tp, cost=COST):
+    mask = y_pred_tp > 0
+    hit = mask & (y_true_max >= y_pred_tp)
+    miss = mask & (y_true_max < y_pred_tp)
+    pnl = np.sum(y_pred_tp[hit] - 1.0 - cost)
+    pnl += np.sum(np.maximum(y_true_end[miss] - 1.0 - cost, -1.0))
+    return float(pnl)
 """))
 
 # Cell 2: Creation Metadata Features
@@ -441,21 +444,32 @@ else:
 print(f"Tape ingestion finished. Shape: {TAPE_DF.shape}")
 """))
 
-# Cell 4: Causal Participant & Deployer History
-cells.append(nbf.v4.new_markdown_cell("""## 3. Causal Creator History & Participant Reputation Engine"""))
+# Cell 4: Causal Participant & Deployer History with Bayesian Shrinkage
+cells.append(nbf.v4.new_markdown_cell("""## 3. Causal Creator History & Participant Reputation Engine
+- Invariant: Two-pointer 3600s embargo ($mt_j \\le mt_i - 3600$).
+- Empirical Bayesian Shrinkage ($m$-estimate smoothing, $m = 5$).
+- SOL trade size weighting and 7-day half-life exponential recency decay.
+"""))
 
 cells.append(nbf.v4.new_code_cell("""REPUTATION_COLS = [
     'w_known', 'w_hit_max', 'w_hit_mean', 'w_hit_top3', 
     'w_elite_n', 'w_elite_share', 'w_eb_score',
     'w_decay_eb_score', 'w_decay_hits',
-    'c_known', 'c_hit_rate', 'c_decay_rate',
+    'w_shrunk_rate_max', 'w_shrunk_rate_mean', 'w_shrunk_rate_top3',
+    'w_shrunk_sol_rate_max', 'w_shrunk_sol_rate_mean', 'w_decay_hits_weighted',
+    'w_elite_size_share',
+    'c_known', 'c_hit_rate', 'c_decay_rate', 'c_shrunk_rate',
     'c_launches', 'c_median_peak', 'c_max_peak',
     'c_hit_3x', 'c_hit_5x', 'c_last_peak', 'c_time_since_last'
 ]
 
-def build_causal_reputation(tokens_df, amm_edges_df, creator_map=None, target_k=5.0, win=3600, tau_decay=5*86400):
+def build_causal_reputation(tokens_df, amm_edges_df, creator_map=None, target_k=TARGET_K, win=WIN, m_shrinkage=M_SHRINKAGE, base_rate=GLOBAL_BASE_RATE):
     tok = tokens_df[['mint', 'mt']].copy()
-    tok['max_x'] = tokens_df['max_x'].values if 'max_x' in tokens_df.columns else np.nan
+    if 'max_x' in tokens_df.columns:
+        tok['max_x'] = tokens_df['max_x'].values
+    else:
+        tok['max_x'] = np.nan
+        
     tok = tok.sort_values('mt', kind='stable').reset_index(drop=True)
     
     if amm_edges_df is not None and len(amm_edges_df) > 0:
@@ -472,8 +486,11 @@ def build_causal_reputation(tokens_df, amm_edges_df, creator_map=None, target_k=
         
     appear = np.zeros(nW, dtype=np.int32)
     hit = np.zeros(nW, dtype=np.int32)
+    last_update_ts = np.zeros(nW, dtype=np.float64)
     decay_appear = np.zeros(nW, dtype=np.float32)
     decay_hit = np.zeros(nW, dtype=np.float32)
+    decay_sol_appear = np.zeros(nW, dtype=np.float32)
+    decay_sol_hit = np.zeros(nW, dtype=np.float32)
     
     creator_appear = {}
     creator_hit = {}
@@ -485,68 +502,103 @@ def build_causal_reputation(tokens_df, amm_edges_df, creator_map=None, target_k=
     mts = tok.mt.values
     mxs = tok.max_x.values
     mints = tok.mint.values
+    n = len(tok)
     
-    out = np.zeros((len(tok), len(REPUTATION_COLS)), dtype=float)
+    out = np.zeros((n, len(REPUTATION_COLS)), dtype=float)
     j = 0
-    alpha_prior = 1.0
-    beta_prior = 15.0
     
-    for i in range(len(tok)):
-        cur_t = mts[i]
-        while j < len(tok) and mts[j] <= cur_t - win:
-            t_res = mts[j]
+    for i in range(n):
+        cur_t = float(mts[i])
+        
+        # Advance resolution pointer and commit resolved tokens (strictly mt_j <= cur_t - 3600)
+        while j < n and mts[j] <= cur_t - win:
+            t_res = float(mts[j])
             if not np.isnan(mxs[j]):
+                is_hit = int(mxs[j] >= target_k)
                 w = by_mint.get(mints[j])
                 if w is not None:
-                    wids = w[0]
-                    np.add.at(appear, wids, 1)
-                    decay_factor = np.exp(-(cur_t - t_res) / max(tau_decay, 1.0))
-                    np.add.at(decay_appear, wids, decay_factor)
-                    if mxs[j] >= target_k:
-                        np.add.at(hit, wids, 1)
-                        np.add.at(decay_hit, wids, decay_factor)
+                    wids, sols = w
+                    for wid, sol_val in zip(wids, sols):
+                        sol_w = float(min(max(sol_val, 0.01), 10.0))
+                        prev_t = last_update_ts[wid]
+                        if prev_t > 0:
+                            dt = max(t_res - prev_t, 0.0)
+                            dec = float(np.exp(-dt * DECAY_LAMBDA))
+                            decay_appear[wid] = decay_appear[wid] * dec
+                            decay_hit[wid] = decay_hit[wid] * dec
+                            decay_sol_appear[wid] = decay_sol_appear[wid] * dec
+                            decay_sol_hit[wid] = decay_sol_hit[wid] * dec
+                        
+                        appear[wid] += 1
+                        hit[wid] += is_hit
+                        decay_appear[wid] += 1.0
+                        decay_hit[wid] += float(is_hit)
+                        decay_sol_appear[wid] += sol_w
+                        decay_sol_hit[wid] += sol_w * float(is_hit)
+                        last_update_ts[wid] = t_res
                         
                 if creator_map is not None:
                     c_wallet = creator_map.get(mints[j])
                     if c_wallet and str(c_wallet) != 'nan' and len(str(c_wallet)) > 0:
-                        decay_factor = np.exp(-(cur_t - t_res) / max(tau_decay, 1.0))
+                        prev_c_t = creator_last_ts.get(c_wallet, t_res)
+                        dt = max(t_res - prev_c_t, 0.0)
+                        dec = float(np.exp(-dt * DECAY_LAMBDA))
+                        
                         creator_appear[c_wallet] = creator_appear.get(c_wallet, 0) + 1
-                        creator_decay_ap[c_wallet] = creator_decay_ap.get(c_wallet, 0.0) + decay_factor
+                        creator_decay_ap[c_wallet] = creator_decay_ap.get(c_wallet, 0.0) * dec + 1.0
                         
                         if c_wallet not in creator_past_peaks:
                             creator_past_peaks[c_wallet] = []
                         creator_past_peaks[c_wallet].append(float(mxs[j]))
                         creator_last_ts[c_wallet] = t_res
                         
-                        if mxs[j] >= target_k:
+                        if is_hit:
                             creator_hit[c_wallet] = creator_hit.get(c_wallet, 0) + 1
-                            creator_decay_ht[c_wallet] = creator_decay_ht.get(c_wallet, 0.0) + decay_factor
+                            creator_decay_ht[c_wallet] = creator_decay_ht.get(c_wallet, 0.0) * dec + 1.0
             j += 1
             
         w = by_mint.get(mints[i])
         if w is not None:
             wids, sols = w
             ap = appear[wids]
-            known = ap >= 3
+            known = ap >= 2
+            
             if known.sum() > 0:
-                ht = hit[wids][known]
+                k_wids = wids[known]
+                k_sols = sols[known]
                 ap_k = ap[known]
-                rate = ht / ap_k
-                eb_rates = (ht + alpha_prior) / (ap_k + alpha_prior + beta_prior)
-                d_ap = decay_appear[wids][known]
-                d_ht = decay_hit[wids][known]
-                decay_eb = (d_ht + alpha_prior) / (d_ap + alpha_prior + beta_prior)
-                elite = (ap >= 5) & (hit[wids] >= 1)
+                ht_k = hit[k_wids]
+                
+                shrunk_rates = (ht_k + m_shrinkage * base_rate) / (ap_k + m_shrinkage)
+                raw_rates = ht_k / np.maximum(ap_k, 1)
+                
+                k_last_t = last_update_ts[k_wids]
+                dt_vals = np.maximum(cur_t - k_last_t, 0.0)
+                decay_multipliers = np.exp(-dt_vals * DECAY_LAMBDA)
+                
+                cur_decay_sol_ap = decay_sol_appear[k_wids] * decay_multipliers
+                cur_decay_sol_ht = decay_sol_hit[k_wids] * decay_multipliers
+                
+                shrunk_sol_rates = (cur_decay_sol_ht + m_shrinkage * base_rate) / (cur_decay_sol_ap + m_shrinkage)
+                is_elite = (shrunk_sol_rates >= 0.15) & (ap_k >= 3)
                 
                 out[i, 0] = int(known.sum())
-                out[i, 1] = float(rate.max())
-                out[i, 2] = float(rate.mean())
-                out[i, 3] = float(np.sort(rate)[-3:].mean())
-                out[i, 4] = int(elite.sum())
-                out[i, 5] = float(sols[elite].sum() / max(sols.sum(), 1e-9))
-                out[i, 6] = float(eb_rates.max())
-                out[i, 7] = float(decay_eb.max())
-                out[i, 8] = float(d_ht.sum())
+                out[i, 1] = float(np.max(raw_rates))
+                out[i, 2] = float(np.mean(raw_rates))
+                out[i, 3] = float(np.sort(raw_rates)[-3:].mean())
+                out[i, 4] = int(is_elite.sum())
+                out[i, 5] = float(k_sols[is_elite].sum() / max(sols.sum(), 1e-9))
+                out[i, 6] = float(np.max(shrunk_rates))
+                out[i, 7] = float(np.max(shrunk_sol_rates))
+                out[i, 8] = float(cur_decay_sol_ht.sum())
+                
+                out[i, 9] = float(np.max(shrunk_rates))
+                out[i, 10] = float(np.mean(shrunk_rates))
+                out[i, 11] = float(np.sort(shrunk_rates)[-3:].mean())
+                out[i, 12] = float(np.max(shrunk_sol_rates))
+                out[i, 13] = float(np.mean(shrunk_sol_rates))
+                out[i, 14] = float(cur_decay_sol_ht.sum())
+                out[i, 15] = float(k_sols[is_elite].sum() / max(sols.sum(), 1e-9))
                 
         if creator_map is not None:
             c_wallet = creator_map.get(mints[i])
@@ -554,20 +606,25 @@ def build_causal_reputation(tokens_df, amm_edges_df, creator_map=None, target_k=
                 c_ap = creator_appear.get(c_wallet, 0)
                 if c_ap > 0:
                     c_ht = creator_hit.get(c_wallet, 0)
-                    out[i, 9] = 1.0
-                    out[i, 10] = float(c_ht / c_ap)
-                    out[i, 11] = float((creator_decay_ht.get(c_wallet, 0.0) + alpha_prior) / 
-                                       (creator_decay_ap.get(c_wallet, 0.0) + alpha_prior + beta_prior))
+                    dt_c = max(cur_t - creator_last_ts.get(c_wallet, cur_t), 0.0)
+                    dec_c = float(np.exp(-dt_c * DECAY_LAMBDA))
+                    c_dec_ap = creator_decay_ap.get(c_wallet, 0.0) * dec_c
+                    c_dec_ht = creator_decay_ht.get(c_wallet, 0.0) * dec_c
+                    
+                    out[i, 16] = 1.0
+                    out[i, 17] = float(c_ht / c_ap)
+                    out[i, 18] = float((c_dec_ht + m_shrinkage * base_rate) / (c_dec_ap + m_shrinkage))
+                    out[i, 19] = float((c_ht + m_shrinkage * base_rate) / (c_ap + m_shrinkage))
                     
                 if c_wallet in creator_past_peaks:
                     peaks = creator_past_peaks[c_wallet]
-                    out[i, 12] = len(peaks)
-                    out[i, 13] = float(np.median(peaks))
-                    out[i, 14] = float(np.max(peaks))
-                    out[i, 15] = float(np.mean([p >= 3.0 for p in peaks]))
-                    out[i, 16] = float(np.mean([p >= 5.0 for p in peaks]))
-                    out[i, 17] = float(peaks[-1])
-                    out[i, 18] = float(cur_t - creator_last_ts.get(c_wallet, cur_t))
+                    out[i, 20] = len(peaks)
+                    out[i, 21] = float(np.median(peaks))
+                    out[i, 22] = float(np.max(peaks))
+                    out[i, 23] = float(np.mean([p >= 3.0 for p in peaks]))
+                    out[i, 24] = float(np.mean([p >= 5.0 for p in peaks]))
+                    out[i, 25] = float(peaks[-1])
+                    out[i, 26] = float(cur_t - creator_last_ts.get(c_wallet, cur_t))
                     
     rep_df = pd.DataFrame(out, columns=REPUTATION_COLS)
     rep_df['mint'] = mints
@@ -601,26 +658,36 @@ print(f"Final feature space: {len(FE)} features.")
 """))
 
 # Cell 6: Decoupled Two-Stage Model
-cells.append(nbf.v4.new_markdown_cell("""## 4. Decoupled Two-Stage Gatekeeper & Utility Maximizer Engine"""))
+cells.append(nbf.v4.new_markdown_cell("""## 4. Decoupled Two-Stage Gatekeeper & Multi-Level Expected Utility Engine"""))
 
 cells.append(nbf.v4.new_code_cell("""LGB_PARAMS = dict(
-    n_estimators=300, learning_rate=0.04, num_leaves=31, min_child_samples=40,
+    n_estimators=350, learning_rate=0.04, num_leaves=31, min_child_samples=40,
     subsample=0.80, subsample_freq=1, colsample_bytree=0.70, verbose=-1, n_jobs=-1
 )
 
+STAGE1_PATTERN = r'bs_|bundle|dev_balance|is_micro|token2022|gas|instruction|lookup|creation|is_ipfs|is_bot|is_deployer|custom_domain|name_|symbol_|amm_gini|amm_hhi|amm_top1|unique_buyers|trades_per|wallet_max|fee_mismatch|creator_sell|creator_buy|early_dump|flip_rate|slot_snipe|c_launches|c_hit_3x|c_hit_5x|curve_failed'
+STAGE2_PATTERN = r'w_shrunk|w_decay|w_elite|w_known|d2v|rel_flow|flow_accel|bp_|late_|fresh_wallets|amm_uw|amm_sol|buysell|net_sol|buy_max|whale_buys|ret60|runup|at_high|drawdown|vol|depth|impact|curve_dur|curve_sol|migration_pop|c_max_peak|c_median_peak|c_last_peak|c_shrunk_rate'
+
 class TwoStageDecisionEngine:
     def __init__(self, feature_cols, levels=LEVELS, seeds=SEEDS, lgb_params=LGB_PARAMS, cost=COST):
-        self.feature_cols = feature_cols
+        self.all_feature_cols = feature_cols
         self.levels = np.array(levels, dtype=float)
         self.seeds = seeds
         self.lgb_params = lgb_params
         self.cost = cost
+        
+        s1 = [c for c in feature_cols if re.search(STAGE1_PATTERN, c, re.I)]
+        s2 = [c for c in feature_cols if re.search(STAGE2_PATTERN, c, re.I)]
+        self.stage1_cols = s1 if len(s1) >= 10 else feature_cols
+        self.stage2_cols = s2 if len(s2) >= 10 else feature_cols
+        
         self.calibrator = None
         self.gatekeeper_models = []
         self.level_models = {lv: [] for lv in self.levels}
+        self.tau_scalar = 0.20
 
     def fit_gatekeeper(self, train_df):
-        X_tr = train_df[self.feature_cols].astype(float).fillna(0).values
+        X_tr = train_df[self.stage1_cols].astype(float).fillna(0).values
         y_tr_3x = (train_df['max_x'].values >= 3.0).astype(int)
         
         self.gatekeeper_models = [
@@ -635,9 +702,9 @@ class TwoStageDecisionEngine:
         trn_old = train_df[(train_df.day < cal_days[0]) & (train_df.mt <= trn_cal.mt.min() - WIN - EMBARGO)].reset_index(drop=True)
         
         if len(trn_old) >= 500:
-            X_old = trn_old[self.feature_cols].astype(float).fillna(0).values
+            X_old = trn_old[self.stage1_cols].astype(float).fillna(0).values
             y_old = (trn_old['max_x'].values >= 3.0).astype(int)
-            X_cal = trn_cal[self.feature_cols].astype(float).fillna(0).values
+            X_cal = trn_cal[self.stage1_cols].astype(float).fillna(0).values
             y_cal = (trn_cal['max_x'].values >= 3.0).astype(int)
             
             p_cal_raw = np.mean([
@@ -649,21 +716,31 @@ class TwoStageDecisionEngine:
             
             self.calibrator = LogisticRegression()
             self.calibrator.fit(p_cal_raw.reshape(-1, 1), y_cal)
+            self.p_cal_oof = self.calibrator.predict_proba(p_cal_raw.reshape(-1, 1))[:, 1]
+            self.trn_cal_len = len(trn_cal)
+            self.cal_days_len = len(cal_days)
         else:
             self.calibrator = None
+            self.p_cal_oof = None
+            self.trn_cal_len = 0
+            self.cal_days_len = 0
 
     def predict_gatekeeper(self, test_df):
-        X_te = test_df[self.feature_cols].astype(float).fillna(0).values
+        X_te = test_df[self.stage1_cols].astype(float).fillna(0).values
         p_raw = np.mean([m.predict_proba(X_te)[:, 1] for m in self.gatekeeper_models], axis=0)
         if self.calibrator is not None:
             return self.calibrator.predict_proba(p_raw.reshape(-1, 1))[:, 1]
         return p_raw
 
     def fit_levels(self, train_df):
-        X_tr = train_df[self.feature_cols].astype(float).fillna(0).values
+        X_tr = train_df[self.stage2_cols].astype(float).fillna(0).values
         mxs_tr = train_df['max_x'].values
+        
         for lv in self.levels:
             y_lv = (mxs_tr >= lv).astype(int)
+            if y_lv.sum() < 15:
+                self.level_models[lv] = [float(y_lv.mean())]
+                continue
             self.level_models[lv] = [
                 lgb.LGBMClassifier(random_state=s, **self.lgb_params)
                 .fit(X_tr, y_lv)
@@ -671,10 +748,14 @@ class TwoStageDecisionEngine:
             ]
 
     def predict_levels(self, test_df):
-        X_te = test_df[self.feature_cols].astype(float).fillna(0).values
+        X_te = test_df[self.stage2_cols].astype(float).fillna(0).values
         probs = np.zeros((len(test_df), len(self.levels)), dtype=float)
         for j, lv in enumerate(self.levels):
-            probs[:, j] = np.mean([m.predict_proba(X_te)[:, 1] for m in self.level_models[lv]], axis=0)
+            models = self.level_models[lv]
+            if isinstance(models[0], (float, int)):
+                probs[:, j] = float(models[0])
+            else:
+                probs[:, j] = np.mean([m.predict_proba(X_te)[:, 1] for m in models], axis=0)
         return np.minimum.accumulate(probs, axis=1)
 
     def compute_miss_payoffs(self, train_df):
@@ -692,44 +773,162 @@ class TwoStageDecisionEngine:
         held_row = held_by_level[None, :]
         return probs_monotonic * win_pnl + (1.0 - probs_monotonic) * held_row
 
-    def decide(self, p_gatekeeper, ev_matrix, top_n_daily=2, min_prob_hurdle=0.20, min_ev_margin=0.0):
+    def calibrate_scalar_threshold(self, train_df=None, target_daily_trades=2.5):
+        if getattr(self, 'p_cal_oof', None) is not None and self.trn_cal_len > 0:
+            avg_tokens_per_day = max(self.trn_cal_len / float(self.cal_days_len), 10.0)
+            q = min(max(target_daily_trades / avg_tokens_per_day, 0.001), 0.05)
+            self.tau_scalar = float(np.quantile(self.p_cal_oof, 1.0 - q))
+        elif train_df is not None:
+            d_trn = sorted(train_df.day.unique())
+            cal_days = d_trn[-HOLD_DAYS:]
+            trn_cal = train_df[train_df.day.isin(cal_days)].reset_index(drop=True)
+            p_cal = self.predict_gatekeeper(trn_cal)
+            avg_tokens_per_day = max(len(trn_cal) / float(len(cal_days)), 10.0)
+            q = min(max(target_daily_trades / avg_tokens_per_day, 0.001), 0.05)
+            self.tau_scalar = float(np.quantile(p_cal, 1.0 - q))
+        else:
+            self.tau_scalar = 0.20
+        return self.tau_scalar
+
+    def decide_per_token(self, p_gatekeeper, ev_matrix, tau_scalar=None, min_ev_margin=None):
+        tau = self.tau_scalar if tau_scalar is None else tau_scalar
         n = len(p_gatekeeper)
         final_tp = np.zeros(n, dtype=float)
         best_lv_idx = np.argmax(ev_matrix, axis=1)
         best_ev = ev_matrix[np.arange(n), best_lv_idx]
         best_tp = self.levels[best_lv_idx]
         
-        valid_mask = (p_gatekeeper >= min_prob_hurdle) & (best_ev >= min_ev_margin)
-        valid_indices = np.where(valid_mask)[0]
-        
-        if len(valid_indices) > 0 and top_n_daily > 0:
-            scores = p_gatekeeper[valid_indices]
-            order = np.argsort(-scores)
-            selected = valid_indices[order[:top_n_daily]]
-            final_tp[selected] = best_tp[selected]
-        elif (final_tp > 0).sum() == 0 and top_n_daily > 0:
-            order = np.argsort(-best_ev)
-            top_cand = [idx for idx in order[:top_n_daily] if best_ev[idx] >= -0.20]
-            if top_cand:
-                final_tp[top_cand] = best_tp[top_cand]
+        if min_ev_margin is not None:
+            is_buy = (p_gatekeeper >= tau) & (best_ev >= min_ev_margin)
+        else:
+            is_buy = (p_gatekeeper >= tau)
+            
+        final_tp[is_buy] = best_tp[is_buy]
         return final_tp, best_ev
 """))
 
-# Cell 7: Full Production Fit & Submission
-cells.append(nbf.v4.new_markdown_cell("""## 5. Full Production Fit & Validated Submission Generation"""))
+# Cell 7: Full 16-Day Walk-Forward Benchmark (Offline Evaluation)
+cells.append(nbf.v4.new_markdown_cell("""## 5. Strict 16-Day Walk-Forward Comparative Benchmark
+- Evaluates 1 fold per day across the last 16 days.
+- Invariant enforced: `target_mt <= mt_train_max - 3600`.
+- Compares Decoupled Two-Stage Engine against flat $tp=5$ baseline.
+"""))
+
+cells.append(nbf.v4.new_code_cell("""days = sorted(TR['day'].unique())
+eval_days = days[-16:]
+print(f"Running 16-day embargoed walk-forward evaluation across: {eval_days[0]} to {eval_days[-1]}...")
+
+baseline_records = []
+two_stage_records = []
+
+wf_engine = TwoStageDecisionEngine(feature_cols=FE)
+
+for i, day in enumerate(eval_days, 1):
+    val = TR[TR['day'] == day].reset_index(drop=True)
+    trn = TR[(TR['day'] < day) & (TR['mt'] <= val['mt'].min() - WIN - EMBARGO)].reset_index(drop=True)
+    
+    if len(trn) < 500 or len(val) < 10:
+        continue
+        
+    mxs_val = val['max_x'].values
+    fxs_val = val['final_x'].values
+    
+    # 1. Baseline tp = 5
+    X_tr = trn[FE].astype(float).fillna(0).values
+    y_tr_5x = (trn['max_x'].values >= 5.0).astype(int)
+    X_val = val[FE].astype(float).fillna(0).values
+    
+    base_model = lgb.LGBMClassifier(random_state=SEEDS[0], **LGB_PARAMS).fit(X_tr, y_tr_5x)
+    p_base_val = base_model.predict_proba(X_val)[:, 1]
+    
+    cal_days = sorted(trn['day'].unique())[-HOLD_DAYS:]
+    trn_cal = trn[trn['day'].isin(cal_days)].reset_index(drop=True)
+    trn_old = trn[(trn['day'] < cal_days[0]) & (trn['mt'] <= trn_cal['mt'].min() - WIN - EMBARGO)].reset_index(drop=True)
+    if len(trn_old) >= 500:
+        base_cal_model = lgb.LGBMClassifier(random_state=SEEDS[0], **LGB_PARAMS).fit(
+            trn_old[FE].astype(float).fillna(0).values,
+            (trn_old['max_x'].values >= 5.0).astype(int)
+        )
+        p_base_cal = base_cal_model.predict_proba(trn_cal[FE].astype(float).fillna(0).values)[:, 1]
+    else:
+        p_base_cal = p_base_val
+        
+    q_base = min(max(2.5 / max(len(trn_cal) / float(len(cal_days)), 10.0), 0.001), 0.05)
+    tau_base = float(np.quantile(p_base_cal, 1.0 - q_base))
+    
+    tp_base = np.where(p_base_val >= tau_base, 5.0, 0.0)
+    pnl_base = evaluate_pnl(mxs_val, fxs_val, tp_base)
+    taken_base = int((tp_base > 0).sum())
+    hits_base = int(((mxs_val >= 5.0) & (tp_base > 0)).sum())
+    
+    baseline_records.append({'day': day, 'taken': taken_base, 'hits': hits_base, 'pnl': pnl_base})
+    
+    # 2. Two-Stage Decoupled Engine
+    wf_engine.fit_gatekeeper(trn)
+    wf_engine.fit_levels(trn)
+    
+    p_gate = wf_engine.predict_gatekeeper(val)
+    p_levels = wf_engine.predict_levels(val)
+    miss_payoffs = wf_engine.compute_miss_payoffs(trn)
+    ev_matrix = wf_engine.calculate_expected_values(p_levels, miss_payoffs)
+    
+    tau_scalar = wf_engine.calibrate_scalar_threshold(trn, target_daily_trades=2.5)
+    tp_twostage, _ = wf_engine.decide_per_token(p_gate, ev_matrix, tau_scalar=tau_scalar)
+    
+    pnl_twostage = evaluate_pnl(mxs_val, fxs_val, tp_twostage)
+    taken_twostage = int((tp_twostage > 0).sum())
+    hits_twostage = int(((mxs_val >= tp_twostage) & (tp_twostage > 0)).sum())
+    
+    two_stage_records.append({'day': day, 'taken': taken_twostage, 'hits': hits_twostage, 'pnl': pnl_twostage})
+    print(f"[{i:02d}/16] Day {day} | Baseline (tp=5): trades={taken_base:>2}, PnL={pnl_base:+6.2f} SOL | "
+          f"Two-Stage: trades={taken_twostage:>2}, hits={hits_twostage:>2}, PnL={pnl_twostage:+6.2f} SOL")
+
+b_df = pd.DataFrame(baseline_records)
+t_df = pd.DataFrame(two_stage_records)
+
+print("\\n" + "=" * 90)
+print("16-DAY EMBARGOED WALK-FORWARD HEAD-TO-HEAD COMPARISON")
+print("=" * 90)
+print(f"{'Strategy Architecture':<38} | {'Trades':<6} | {'Hits':<5} | {'Precision':<10} | {'Total PnL':<12} | {'Sharpe':<7} | {'Win Days'}")
+print("-" * 90)
+
+b_tot_trades = b_df['taken'].sum()
+b_tot_hits = b_df['hits'].sum()
+b_tot_pnl = b_df['pnl'].sum()
+b_prec = (b_tot_hits / max(b_tot_trades, 1)) * 100.0
+b_sharpe = b_df['pnl'].mean() - 0.25 * b_df['pnl'].std(ddof=0)
+b_win = (b_df['pnl'] > 0).sum()
+
+t_tot_trades = t_df['taken'].sum()
+t_tot_hits = t_df['hits'].sum()
+t_tot_pnl = t_df['pnl'].sum()
+t_prec = (t_tot_hits / max(t_tot_trades, 1)) * 100.0
+t_sharpe = t_df['pnl'].mean() - 0.25 * t_df['pnl'].std(ddof=0)
+t_win = (t_df['pnl'] > 0).sum()
+
+print(f"{'Flat tp=5 Single-Stage Baseline':<38} | {b_tot_trades:<6} | {b_tot_hits:<5} | {b_prec:>8.1f}% | {b_tot_pnl:>+9.2f} SOL | {b_sharpe:>6.2f} | {b_win:>2}/16")
+print(f"{'Decoupled Two-Stage Engine (Causal)':<38} | {t_tot_trades:<6} | {t_tot_hits:<5} | {t_prec:>8.1f}% | {t_tot_pnl:>+9.2f} SOL | {t_sharpe:>6.2f} | {t_win:>2}/16")
+print("=" * 90)
+"""))
+
+# Cell 8: Full Production Fit & Submission Generation
+cells.append(nbf.v4.new_markdown_cell("""## 6. Full Production Fit & Submission Generation"""))
 
 cells.append(nbf.v4.new_code_cell("""print("Training production Two-Stage Decoupled Engine on full historical universe...")
-engine = TwoStageDecisionEngine(feature_cols=FE)
-engine.fit_gatekeeper(TR)
-engine.fit_levels(TR)
+prod_engine = TwoStageDecisionEngine(feature_cols=FE)
+prod_engine.fit_gatekeeper(TR)
+prod_engine.fit_levels(TR)
 
 print("Generating calibrated Stage 1 probabilities & Stage 2 expected values...")
-test_p_gate = engine.predict_gatekeeper(TE)
-test_p_levels = engine.predict_levels(TE)
-miss_payoffs = engine.compute_miss_payoffs(TR)
-test_ev = engine.calculate_expected_values(test_p_levels, miss_payoffs)
+test_p_gate = prod_engine.predict_gatekeeper(TE)
+test_p_levels = prod_engine.predict_levels(TE)
+miss_payoffs = prod_engine.compute_miss_payoffs(TR)
+test_ev = prod_engine.calculate_expected_values(test_p_levels, miss_payoffs)
 
-test_tp, best_ev = engine.decide(test_p_gate, test_ev, top_n_daily=2, min_prob_hurdle=0.20, min_ev_margin=0.0)
+tau_scalar = prod_engine.calibrate_scalar_threshold(TR, target_daily_trades=2.5)
+print(f"Causal scalar cutoff: tau = {tau_scalar:.4f}")
+
+test_tp, best_ev = prod_engine.decide_per_token(test_p_gate, test_ev, tau_scalar=tau_scalar)
 
 sub = pd.DataFrame({'mint': TE['mint'], 'tp': test_tp})
 
@@ -738,7 +937,7 @@ if os.path.exists(sample_path):
     sample_sub = pd.read_csv(sample_path)
     sub = sample_sub[['mint']].merge(sub, on='mint', how='left')
     sub['tp'] = sub['tp'].fillna(0.0).astype(float)
-    assert len(sub) == len(sample_sub), "Row count mismatch"
+    assert len(sub) == len(sample_sub), f"Row count mismatch: {len(sub)} vs {len(sample_sub)}"
     assert sub['mint'].equals(sample_sub['mint']), "Mint alignment mismatch"
 
 valid_mask = (sub['tp'] == 0.0) | ((sub['tp'] >= 3.0) & (sub['tp'] <= 100.0))
@@ -759,8 +958,6 @@ print(f"Tokens allocated long entries: {num_buys} ({num_buys / len(sub) * 100:.2
 print(f"Tokens skipped at zero cost (tp = 0): {len(sub) - num_buys}")
 print("Take-profit level allocation counts:")
 print(sub[sub.tp > 0]['tp'].value_counts().sort_index())
-if num_buys > 0:
-    display(sub[sub.tp > 0].head(10))
 """))
 
 nb['cells'] = cells
@@ -768,4 +965,4 @@ nb['cells'] = cells
 with open('notebooks/submission_pipeline.ipynb', 'w', encoding='utf-8') as f:
     nbf.write(nb, f)
 
-print(f"Successfully generated upgraded notebooks/submission_pipeline.ipynb with {len(cells)} cells.")
+print(f"Successfully generated sanitized notebooks/submission_pipeline.ipynb with {len(cells)} cells.")

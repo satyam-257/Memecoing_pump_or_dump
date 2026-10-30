@@ -87,3 +87,4 @@ def enrich_deployers_offline(creators_series):
         'is_repeat_deployer': is_repeat.values,
         'deployer_launch_volume': launch_volume.values
     })
+

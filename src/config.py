@@ -22,12 +22,12 @@ WSOL = "So11111111111111111111111111111111111111112"
 # Financial & Market Constants
 COST = 0.30          # Aggregate round-trip execution friction in SOL (fees + slippage)
 TARGET_K = 5.0       # Primary take-profit multiplier hurdle
-LEVELS = [3.0, 4.0, 5.0, 7.0, 10.0, 15.0]  # Multi-level take-profit grid
+LEVELS = [4.0, 5.0, 6.0, 8.0, 12.0, 20.0, 100.0]  # Decoupled take-profit grid including 100x moonshot
 KILL_THRESH = 1.50   # Cascade stage-1 survival threshold
 WIN = 3600           # Evaluation holding horizon (1 hour in seconds)
 EMBARGO = 3600       # Embargo window before validation day start
 HOLD_DAYS = 5        # Number of recent training days used to calibrate decision thresholds
-TAU_DECAY = 5 * 86400 # 5-day exponential half-life for reputation recency decay
+TAU_DECAY = 7 * 86400 # 7-day exponential half-life for reputation recency decay
 
 # Multi-seed ensemble configuration
 SEEDS = [42, 101, 2024, 7, 777]

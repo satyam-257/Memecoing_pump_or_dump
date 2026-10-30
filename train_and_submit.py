@@ -102,7 +102,10 @@ def main():
     miss_payoffs = engine.compute_miss_payoffs(TR)
     test_ev = engine.calculate_expected_values(test_p_levels, miss_payoffs)
     
-    test_tp, best_ev = engine.decide(test_p_gate, test_ev, top_n_daily=2, min_prob_hurdle=0.20, min_ev_margin=0.0)
+    # Causal per-token execution rule (zero test ranking or peeking)
+    tau_scalar = engine.calibrate_scalar_threshold(TR, target_daily_trades=2.5)
+    print(f"Calibrated causal Stage 1 scalar cutoff on last 5 training days: tau = {tau_scalar:.4f}")
+    test_tp, best_ev = engine.decide_per_token(test_p_gate, test_ev, tau_scalar=tau_scalar)
     
     # Build verified submission dataframe
     sub = pd.DataFrame({
