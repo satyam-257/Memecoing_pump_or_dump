@@ -57,3 +57,24 @@
 1. **Superior Precision**: The Decoupled Two-Stage Gatekeeper achieved **`21.7%` precision** (5 hits out of 23 selective trades) vs `18.8%` for the baseline, comfortably exceeding the $19.57\%$ break-even barrier.
 2. **Controlled Trade Velocity**: Averaged **1.44 trades/day** over 16 days, demonstrating strict capital preservation on quiet days ($0.00$ cost) and capturing multiple high-momentum wins on active days (+7.20 SOL, +2.70 SOL, +1.70 SOL).
 3. **Higher Sharpe Ratio**: The Decoupled Two-Stage Engine achieved higher risk-adjusted stability ($\text{Sharpe} = -0.31$ vs $-0.32$).
+
+---
+
+## [2026-11-01] Experiment 03: Walk-Forward Evaluation on Host's Latest 30-Day Rolling Dataset (2026-10-12 to 2026-10-27)
+
+### 1. Dataset Status
+- Synchronized dataset with host's live 30-day rolling snapshot: `train.csv` (17,490 tokens from 2026-09-28 to 2026-10-27) and `test.csv` (320 tokens from 2026-10-28).
+- 100% token coverage in `pumpfun_token_creation.csv` (39,734 tokens).
+
+### 2. 16-Day Embargoed Walk-Forward Benchmark (2026-10-12 to 2026-10-27)
+*Strict Safety Protocol Enforced: `target_mt <= mt_train_max - 3600` on every fold.*
+
+| Strategy Architecture | Total Trades | Hits | Precision (%) | Total Realized PnL (SOL) | Daily Sharpe ($\mu - 0.25\sigma$) | Green Days (out of 16) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Flat TP=5 Single-Stage Baseline** | 30 | 6 | 20.0% | **+5.47 SOL** | -0.38 | 6 / 16 (38%) |
+| **Decoupled Two-Stage Engine (Causal)** | **24** | **3** | **12.5%** | **-12.15 SOL** | **-1.17** | **2 / 16 (12%)** |
+
+### 3. Structural Diagnosis & Architecture Takeaway
+- On low-liquidity regimes, predicting $P(\max(X) \ge 3.0)$ in Stage 1 admits noise tokens that dump before reaching take-profit levels ($4\times - 5\times$).
+- Constraining Stage 1 to filter rugs via bundle structures and wash ratios while ensuring momentum exits align with the $5\times$ target is key to eliminating drawdowns.
+- Live submission (`ref 57818259`) evaluated successfully on Kaggle with `Score: -0.30000` over 320 test tokens (4 selective trades, 316 capital preservation skips).
