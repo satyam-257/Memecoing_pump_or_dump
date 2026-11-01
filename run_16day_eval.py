@@ -80,7 +80,7 @@ def main():
     print(f"Total features: {len(feature_cols)}")
     
     # 4. Run 16-day walk-forward evaluation
-    b_df, t_df = run_16day_comparison(TR, feature_cols)
+    b_df, f5_df, t2_df = run_16day_comparison(TR, feature_cols)
     print(f"\nCompleted 16-day walk-forward evaluation in {time.time()-t0:.1f}s.")
 
 if __name__ == '__main__':

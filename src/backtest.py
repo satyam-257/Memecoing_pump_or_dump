@@ -1,9 +1,9 @@
-"""Strict embargoed walk-forward backtesting protocol and 16-day comparative benchmark."""
+"""Strict embargoed walk-forward backtesting protocol and 16-day comparative benchmark across 3 architectures."""
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
 from src.config import WIN, EMBARGO, LEVELS, COST, SEEDS, LGB_PARAMS, HOLD_DAYS
-from src.models import TwoStageDecisionEngine
+from src.models import UnifiedTwoTierEngine
 
 def evaluate_pnl(y_true_max, y_true_end, y_pred_tp, cost=COST):
     """
@@ -29,20 +29,22 @@ def run_16day_comparison(df, feature_cols):
     """
     Runs a full 16-day walk-forward evaluation (1 fold per day, training only on tokens
     resolved >= 1 hour before the fold day starts) and prints a side-by-side comparison table
-    of total PnL, trade count, and precision against a flat tp=5 baseline.
+    comparing:
+    (a) Flat TP=5 Baseline (Single-Stage LightGBM)
+    (b) Unified LightGBM+CatBoost Entry (target >=5x) with Fixed TP=5
+    (c) Unified LightGBM+CatBoost Entry with Constrained {5.0, 8.0} Exit Upgrade
     """
     days = sorted(df['day'].unique())
     eval_days = days[-16:]
     
-    engine = TwoStageDecisionEngine(feature_cols=feature_cols, levels=LEVELS)
-    
     baseline_records = []
-    two_stage_records = []
+    unified_fixed5_records = []
+    unified_2tier_records = []
     
-    print("=" * 90)
+    print("=" * 105)
     print(f"STARTING 16-DAY EMBARGOED WALK-FORWARD BENCHMARK ({eval_days[0]} to {eval_days[-1]})")
-    print(f"Safety Rule Enforced: target_mt <= mt_train_max - 3600")
-    print("=" * 90)
+    print(f"Safety Protocol Enforced: target_mt <= mt_train_max - 3600 (Strict 1-hour resolution embargo)")
+    print("=" * 105)
     
     for i, day in enumerate(eval_days, 1):
         val = df[df['day'] == day].reset_index(drop=True)
@@ -55,9 +57,9 @@ def run_16day_comparison(df, feature_cols):
         mxs_val = val['max_x'].values
         fxs_val = val['final_x'].values
         
-        # -------------------------------------------------------------
-        # 1. FLAT TP=5 BASELINE (Standard single-stage model)
-        # -------------------------------------------------------------
+        # -----------------------------------------------------------------
+        # (a) FLAT TP=5 BASELINE (Single-Stage LightGBM reference)
+        # -----------------------------------------------------------------
         X_tr = trn[feature_cols].astype(float).fillna(0).values
         y_tr_5x = (trn['max_x'].values >= 5.0).astype(int)
         X_val = val[feature_cols].astype(float).fillna(0).values
@@ -66,7 +68,7 @@ def run_16day_comparison(df, feature_cols):
         base_model.fit(X_tr, y_tr_5x)
         p_base_val = base_model.predict_proba(X_val)[:, 1]
         
-        # Calibrate baseline scalar threshold using OOF holdout to prevent inflation
+        # Calibrate baseline scalar threshold using OOF holdout
         cal_days = sorted(trn['day'].unique())[-HOLD_DAYS:]
         trn_cal = trn[trn['day'].isin(cal_days)].reset_index(drop=True)
         trn_old = trn[(trn['day'] < cal_days[0]) & (trn['mt'] <= trn_cal['mt'].min() - WIN - EMBARGO)].reset_index(drop=True)
@@ -92,64 +94,74 @@ def run_16day_comparison(df, feature_cols):
             'day': day, 'taken': taken_base, 'hits': hits_base, 'pnl': pnl_base
         })
         
-        # -------------------------------------------------------------
-        # 2. UPGRADED DECOUPLED TWO-STAGE ENGINE (Per-Token Causal Execution)
-        # -------------------------------------------------------------
-        engine.fit_gatekeeper(trn)
-        engine.fit_levels(trn)
+        # -----------------------------------------------------------------
+        # (b) & (c) UNIFIED LIGHTGBM + CATBOOST ENTRY & 2-TIER EXIT ENGINE
+        # -----------------------------------------------------------------
+        engine = UnifiedTwoTierEngine(feature_cols=feature_cols, seeds=[42])
+        engine.fit_entry(trn)
         
-        p_gate = engine.predict_gatekeeper(val)
-        p_levels = engine.predict_levels(val)
-        miss_payoffs = engine.compute_miss_payoffs(trn)
-        ev_matrix = engine.calculate_expected_values(p_levels, miss_payoffs)
-        
-        # Per-token scalar cutoff calibrated strictly on trn holdout days (OOF)
+        p_entry = engine.predict_entry(val)
+        ev_matrix = engine.calculate_expected_values(test_df=val)
         tau_scalar = engine.calibrate_scalar_threshold(trn, target_daily_trades=2.5)
-        tp_twostage, _ = engine.decide_per_token(p_gate, ev_matrix, tau_scalar=tau_scalar)
         
-        pnl_twostage = evaluate_pnl(mxs_val, fxs_val, tp_twostage)
-        taken_twostage = int((tp_twostage > 0).sum())
-        hits_twostage = int(((mxs_val >= tp_twostage) & (tp_twostage > 0)).sum())
+        # (b) Architecture B: Unified LGB+CatBoost Entry with Fixed TP=5
+        tp_fixed5, _ = engine.decide_per_token(p_entry, ev_matrix, tau_scalar=tau_scalar, mode='fixed5')
+        pnl_fixed5 = evaluate_pnl(mxs_val, fxs_val, tp_fixed5)
+        taken_fixed5 = int((tp_fixed5 > 0).sum())
+        hits_fixed5 = int(((mxs_val >= 5.0) & (tp_fixed5 > 0)).sum())
         
-        two_stage_records.append({
-            'day': day, 'taken': taken_twostage, 'hits': hits_twostage, 'pnl': pnl_twostage
+        unified_fixed5_records.append({
+            'day': day, 'taken': taken_fixed5, 'hits': hits_fixed5, 'pnl': pnl_fixed5
         })
         
-        print(f"[{i:02d}/16] Day {day} | Baseline (tp=5): trades={taken_base:>2}, hits={hits_base:>2}, PnL={pnl_base:+6.2f} SOL | "
-              f"Two-Stage: trades={taken_twostage:>2}, hits={hits_twostage:>2}, PnL={pnl_twostage:+6.2f} SOL")
+        # (c) Architecture C: Unified LGB+CatBoost Entry with Constrained {5.0, 8.0} Exit Upgrade
+        tp_2tier, _ = engine.decide_per_token(p_entry, ev_matrix, tau_scalar=tau_scalar, safety_margin=0.35, mode='2tier')
+        pnl_2tier = evaluate_pnl(mxs_val, fxs_val, tp_2tier)
+        taken_2tier = int((tp_2tier > 0).sum())
+        hits_2tier = int(((mxs_val >= tp_2tier) & (tp_2tier > 0)).sum())
+        upgrades_2tier = int((tp_2tier == 8.0).sum())
+        
+        unified_2tier_records.append({
+            'day': day, 'taken': taken_2tier, 'hits': hits_2tier, 'upgrades': upgrades_2tier, 'pnl': pnl_2tier
+        })
+        
+        print(f"[{i:02d}/16] Day {day} | (a) Baseline: trades={taken_base:>2}, hits={hits_base:>2}, PnL={pnl_base:+6.2f} SOL | "
+              f"(b) Unified Fixed-5: trades={taken_fixed5:>2}, hits={hits_fixed5:>2}, PnL={pnl_fixed5:+6.2f} SOL | "
+              f"(c) 2-Tier Upgrade: trades={taken_2tier:>2}, hits={hits_2tier:>2} (upg={upgrades_2tier}), PnL={pnl_2tier:+6.2f} SOL")
               
     b_df = pd.DataFrame(baseline_records)
-    t_df = pd.DataFrame(two_stage_records)
+    f5_df = pd.DataFrame(unified_fixed5_records)
+    t2_df = pd.DataFrame(unified_2tier_records)
     
     # Telemetry and summary comparison
-    print("\n" + "=" * 90)
-    print("16-DAY EMBARGOED WALK-FORWARD HEAD-TO-HEAD COMPARISON")
-    print("=" * 90)
-    print(f"{'Strategy Architecture':<38} | {'Trades':<6} | {'Hits':<5} | {'Precision':<10} | {'Total PnL':<12} | {'Sharpe':<7} | {'Win Days'}")
-    print("-" * 90)
+    print("\n" + "=" * 105)
+    print("16-DAY EMBARGOED WALK-FORWARD HEAD-TO-HEAD BENCHMARK RESULTS")
+    print("=" * 105)
+    print(f"{'Strategy Architecture':<42} | {'Trades':<6} | {'Hits':<5} | {'Precision':<10} | {'Total PnL':<12} | {'Sharpe':<7} | {'Win Days'}")
+    print("-" * 105)
     
-    b_tot_trades = b_df['taken'].sum()
-    b_tot_hits = b_df['hits'].sum()
-    b_tot_pnl = b_df['pnl'].sum()
-    b_prec = (b_tot_hits / max(b_tot_trades, 1)) * 100.0
-    b_mean = b_df['pnl'].mean()
-    b_std = b_df['pnl'].std(ddof=0)
-    b_sharpe = b_mean - 0.25 * b_std
-    b_win = (b_df['pnl'] > 0).sum()
+    def print_metrics(name, d):
+        tot_trades = d['taken'].sum()
+        tot_hits = d['hits'].sum()
+        tot_pnl = d['pnl'].sum()
+        prec = (tot_hits / max(tot_trades, 1)) * 100.0
+        mean_pnl = d['pnl'].mean()
+        std_pnl = d['pnl'].std(ddof=0)
+        sharpe = mean_pnl - 0.25 * std_pnl
+        win_days = (d['pnl'] > 0).sum()
+        print(f"{name:<42} | {tot_trades:<6} | {tot_hits:<5} | {prec:>8.1f}% | {tot_pnl:>+10.2f} SOL | {sharpe:>+6.2f} | {win_days}/{len(d)} ({win_days/len(d)*100:.0f}%)")
+        return tot_pnl, sharpe
+        
+    pnl_a, sh_a = print_metrics("(a) Flat TP=5 Single-Stage Baseline", b_df)
+    pnl_b, sh_b = print_metrics("(b) Unified LGB+CB Entry (Fixed TP=5)", f5_df)
+    pnl_c, sh_c = print_metrics("(c) Unified LGB+CB Entry ({5,8} Exit Upgrade)", t2_df)
+    print("=" * 105)
     
-    t_tot_trades = t_df['taken'].sum()
-    t_tot_hits = t_df['hits'].sum()
-    t_tot_pnl = t_df['pnl'].sum()
-    t_prec = (t_tot_hits / max(t_tot_trades, 1)) * 100.0
-    t_mean = t_df['pnl'].mean()
-    t_std = t_df['pnl'].std(ddof=0)
-    t_sharpe = t_mean - 0.25 * t_std
-    t_win = (t_df['pnl'] > 0).sum()
+    diff_b = pnl_b - pnl_a
+    diff_c = pnl_c - pnl_a
+    print(f"Alpha Gain (b vs Baseline): {diff_b:+.2f} SOL")
+    print(f"Alpha Gain (c vs Baseline): {diff_c:+.2f} SOL")
     
-    print(f"{'Flat TP=5 Baseline (Single-Stage)':<38} | {b_tot_trades:<6} | {b_tot_hits:<5} | {b_prec:>8.1f}% | {b_tot_pnl:>+10.2f} SOL | {b_sharpe:>+6.2f} | {b_win}/{len(b_df)} ({b_win/len(b_df)*100:.0f}%)")
-    print(f"{'Two-Stage Gatekeeper + Exit Optimizer':<38} | {t_tot_trades:<6} | {t_tot_hits:<5} | {t_prec:>8.1f}% | {t_tot_pnl:>+10.2f} SOL | {t_sharpe:>+6.2f} | {t_win}/{len(t_df)} ({t_win/len(t_df)*100:.0f}%)")
-    print("=" * 90)
-    
-    diff_pnl = t_tot_pnl - b_tot_pnl
-    print(f"Net Alpha Gain over Baseline: {diff_pnl:+.2f} SOL")
-    return b_df, t_df
+    best_arch = "(c) Unified LGB+CB Entry ({5,8} Exit Upgrade)" if pnl_c >= pnl_b else "(b) Unified LGB+CB Entry (Fixed TP=5)"
+    print(f"\nWinning Strategy to Deploy: {best_arch}")
+    return b_df, f5_df, t2_df

@@ -1,63 +1,65 @@
-"""Decoupled Two-Stage Decision Engine with Feature Subsets and Causal Per-Token Execution."""
-import re
+"""Unified LightGBM + CatBoost Entry Classifier & Constrained 2-Tier Exit Utility Engine."""
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
+import catboost as cb
 from sklearn.linear_model import LogisticRegression
-from src.config import TARGET_K, LEVELS, COST, SEEDS, LGB_PARAMS, WIN, EMBARGO, HOLD_DAYS
+from src.config import TARGET_K, COST, SEEDS, LGB_PARAMS, WIN, EMBARGO, HOLD_DAYS
 
-# Regex patterns for feature subset decoupling
-STAGE1_PATTERN = r'bs_|bundle|dev_balance|is_micro|token2022|gas|instruction|lookup|creation|is_ipfs|is_bot|is_deployer|custom_domain|name_|symbol_|amm_gini|amm_hhi|amm_top1|unique_buyers|trades_per|wallet_max|fee_mismatch|creator_sell|creator_buy|early_dump|flip_rate|slot_snipe|c_launches|c_hit_3x|c_hit_5x|curve_failed'
-STAGE2_PATTERN = r'w_shrunk|w_decay|w_elite|w_known|d2v|rel_flow|flow_accel|bp_|late_|fresh_wallets|amm_uw|amm_sol|buysell|net_sol|buy_max|whale_buys|ret60|runup|at_high|drawdown|vol|depth|impact|curve_dur|curve_sol|migration_pop|c_max_peak|c_median_peak|c_last_peak|c_shrunk_rate'
+CB_PARAMS = {
+    'iterations': 250,
+    'learning_rate': 0.05,
+    'depth': 6,
+    'thread_count': -1,
+    'verbose': 0
+}
 
-class TwoStageDecisionEngine:
+class UnifiedTwoTierEngine:
     """
-    Decoupled Two-Stage Decision Architecture:
+    Unified Full-Feature Entry Gatekeeper & Constrained 2-Tier Exit Policy:
     
-    1. Stage 1 (Gatekeeper / Rug Filter):
-       - Target: P(max_x >= 3.0)
-       - Feature Subset: Creation bundle metrics, deployer share, Gini concentration,
-         and wash-trading ratios to eliminate immediate rugs.
-       - Probability Calibration: Out-of-fold Platt scaling (Logistic Regression).
-       - Per-Token Thresholding: Calibrated strictly on the last 5 training days
-         to isolate ~2 to 5 trades/day without peeking across the test set.
+    1. Unified Full-Feature Entry Classifier (target: max_x >= 5.0):
+       - Uses ALL features simultaneously (Creation Bundles + Tape Velocity + Shrunk Wallet Reputation).
+       - Never starves the entry gatekeeper of wallet reputation.
+       - Blends LightGBM + CatBoost ensemble probabilities for P(max_x >= 5.0).
+       - Calibrated via Out-of-Fold Logistic Regression on the last 5 training days.
+       - Per-Token Thresholding: Evaluates against fixed scalar cutoff tau* (target ~2 to 5 trades/day)
+         strictly without test peeking.
          
-    2. Stage 2 (Expected PnL Exit Selector):
-       - Target Hurdles: LEVELS = [4.0, 5.0, 6.0, 8.0, 12.0, 20.0, 100.0]
-         (where 100 represents the full 1-hour hold policy under extreme momentum).
-       - Feature Subset: Shrunk wallet reputation (m=5), post-trade reserve pool price
-         velocity (d2V/dt2), and unique buyer inflow.
-       - Utility Maximizer: Evaluates E[PnL(k)] under monotonic probability constraints.
-       - Allocation: k* = argmax_k E[PnL(k)].
+    2. Constrained 2-Tier Exit Policy (locks in baseline 5x edge, upgrades only on high conviction):
+       - Default Exit: tp = 5.0 (+3.70 SOL net payout).
+       - High-Conviction Runner Upgrade: Independently trains calibrated model for P(max_x >= 8.0).
+         Upgrades to tp = 8.0 (+6.70 SOL net payout) iff E[PnL(8.0)] > E[PnL(5.0)] + 0.35 SOL safety margin.
+       - Skips non-qualifying tokens at zero cost (tp = 0.0).
     """
-    def __init__(self, feature_cols, levels=LEVELS, seeds=SEEDS, lgb_params=None, cost=COST):
-        self.all_feature_cols = feature_cols
-        self.levels = np.array(levels, dtype=float)
-        self.seeds = seeds
+    def __init__(self, feature_cols, seeds=SEEDS[:2], lgb_params=None, cb_params=None, cost=COST):
+        self.feature_cols = list(feature_cols)
+        self.seeds = seeds if len(seeds) > 0 else [42]
         self.lgb_params = lgb_params or LGB_PARAMS
+        self.cb_params = cb_params or CB_PARAMS
         self.cost = cost
         
-        # Decouple feature subsets
-        s1 = [c for c in feature_cols if re.search(STAGE1_PATTERN, c, re.I)]
-        s2 = [c for c in feature_cols if re.search(STAGE2_PATTERN, c, re.I)]
-        self.stage1_cols = s1 if len(s1) >= 10 else feature_cols
-        self.stage2_cols = s2 if len(s2) >= 10 else feature_cols
+        # Models
+        self.lgb_entry_models = []
+        self.cat_entry_models = []
+        self.lgb_runner_models = []
+        self.cat_runner_models = []
         
-        self.calibrator = None
-        self.gatekeeper_models = []
-        self.level_models = {lv: [] for lv in self.levels}
+        # Calibrators
+        self.calibrator_5x = None
+        self.calibrator_8x = None
+        self.p_cal_oof = None
+        self.p_cal_8x_oof = None
+        self.trn_cal_len = 0
+        self.cal_days_len = 0
         self.tau_scalar = 0.20
-        self.min_ev_margin = 0.0
+        self.miss_payoffs = {'held_5': -0.95, 'held_8': -0.95}
 
-    def fit_gatekeeper(self, train_df):
-        X_tr = train_df[self.stage1_cols].astype(float).fillna(0).values
-        y_tr_3x = (train_df['max_x'].values >= 3.0).astype(int)
-        
-        self.gatekeeper_models = [
-            lgb.LGBMClassifier(random_state=s, **self.lgb_params)
-            .fit(X_tr, y_tr_3x)
-            for s in self.seeds
-        ]
+    def fit_entry(self, train_df):
+        """Fits the unified entry classifier ensemble (LGBM + CatBoost) on P(max_x >= 5.0)."""
+        X_tr = train_df[self.feature_cols].astype(float).fillna(0).values
+        y_tr_5x = (train_df['max_x'].values >= 5.0).astype(int)
+        y_tr_8x = (train_df['max_x'].values >= 8.0).astype(int)
         
         # Out-of-fold probability calibration using recent holdout days
         d_trn = sorted(train_df.day.unique())
@@ -65,89 +67,159 @@ class TwoStageDecisionEngine:
         trn_cal = train_df[train_df.day.isin(cal_days)].reset_index(drop=True)
         trn_old = train_df[(train_df.day < cal_days[0]) & (train_df.mt <= trn_cal.mt.min() - WIN - EMBARGO)].reset_index(drop=True)
         
-        if len(trn_old) >= 500:
-            X_old = trn_old[self.stage1_cols].astype(float).fillna(0).values
-            y_old = (trn_old['max_x'].values >= 3.0).astype(int)
-            X_cal = trn_cal[self.stage1_cols].astype(float).fillna(0).values
-            y_cal = (trn_cal['max_x'].values >= 3.0).astype(int)
+        if len(trn_old) >= 500 and len(trn_cal) >= 10:
+            X_old = trn_old[self.feature_cols].astype(float).fillna(0).values
+            y_old_5x = (trn_old['max_x'].values >= 5.0).astype(int)
+            y_old_8x = (trn_old['max_x'].values >= 8.0).astype(int)
+            X_cal = trn_cal[self.feature_cols].astype(float).fillna(0).values
+            y_cal_5x = (trn_cal['max_x'].values >= 5.0).astype(int)
+            y_cal_8x = (trn_cal['max_x'].values >= 8.0).astype(int)
             
-            p_cal_raw = np.mean([
-                lgb.LGBMClassifier(random_state=s, **self.lgb_params)
-                .fit(X_old, y_old)
-                .predict_proba(X_cal)[:, 1]
-                for s in self.seeds
-            ], axis=0)
+            oof_5_preds = []
+            oof_8_preds = []
+            for s in self.seeds:
+                # OOF 5x models
+                m_lgb5 = lgb.LGBMClassifier(random_state=s, **self.lgb_params).fit(X_old, y_old_5x)
+                m_cb5 = cb.CatBoostClassifier(random_seed=s, **self.cb_params).fit(X_old, y_old_5x)
+                oof_5_preds.append(0.5 * m_lgb5.predict_proba(X_cal)[:, 1] + 0.5 * m_cb5.predict_proba(X_cal)[:, 1])
+                
+                # OOF 8x models
+                if y_old_8x.sum() >= 10:
+                    m_lgb8 = lgb.LGBMClassifier(random_state=s, **self.lgb_params).fit(X_old, y_old_8x)
+                    m_cb8 = cb.CatBoostClassifier(random_seed=s, **self.cb_params).fit(X_old, y_old_8x)
+                    oof_8_preds.append(0.5 * m_lgb8.predict_proba(X_cal)[:, 1] + 0.5 * m_cb8.predict_proba(X_cal)[:, 1])
+                else:
+                    oof_8_preds.append(np.full(len(X_cal), float(y_old_8x.mean())))
+                    
+            p_oof_5x_raw = np.mean(oof_5_preds, axis=0)
+            p_oof_8x_raw = np.mean(oof_8_preds, axis=0)
             
-            self.calibrator = LogisticRegression()
-            self.calibrator.fit(p_cal_raw.reshape(-1, 1), y_cal)
-            self.p_cal_oof = self.calibrator.predict_proba(p_cal_raw.reshape(-1, 1))[:, 1]
+            self.calibrator_5x = LogisticRegression()
+            self.calibrator_5x.fit(p_oof_5x_raw.reshape(-1, 1), y_cal_5x)
+            self.p_cal_oof = self.calibrator_5x.predict_proba(p_oof_5x_raw.reshape(-1, 1))[:, 1]
+            
+            if y_cal_8x.sum() >= 5:
+                self.calibrator_8x = LogisticRegression()
+                self.calibrator_8x.fit(p_oof_8x_raw.reshape(-1, 1), y_cal_8x)
+                self.p_cal_8x_oof = self.calibrator_8x.predict_proba(p_oof_8x_raw.reshape(-1, 1))[:, 1]
+            else:
+                self.calibrator_8x = None
+                self.p_cal_8x_oof = p_oof_8x_raw
+                
             self.trn_cal_len = len(trn_cal)
             self.cal_days_len = len(cal_days)
         else:
-            self.calibrator = None
+            self.calibrator_5x = None
+            self.calibrator_8x = None
             self.p_cal_oof = None
             self.trn_cal_len = 0
             self.cal_days_len = 0
-
-    def predict_gatekeeper(self, test_df):
-        X_te = test_df[self.stage1_cols].astype(float).fillna(0).values
-        p_raw = np.mean([m.predict_proba(X_te)[:, 1] for m in self.gatekeeper_models], axis=0)
-        if self.calibrator is not None:
-            return self.calibrator.predict_proba(p_raw.reshape(-1, 1))[:, 1]
-        return p_raw
-
-    def fit_levels(self, train_df):
-        X_tr = train_df[self.stage2_cols].astype(float).fillna(0).values
-        mxs_tr = train_df['max_x'].values
+            
+        # Fit full production models on entire train_df
+        self.lgb_entry_models = [
+            lgb.LGBMClassifier(random_state=s, **self.lgb_params).fit(X_tr, y_tr_5x)
+            for s in self.seeds
+        ]
+        self.cat_entry_models = [
+            cb.CatBoostClassifier(random_seed=s, **self.cb_params).fit(X_tr, y_tr_5x)
+            for s in self.seeds
+        ]
         
-        for lv in self.levels:
-            y_lv = (mxs_tr >= lv).astype(int)
-            if y_lv.sum() < 15:
-                # Fallback for extreme levels with rare hits
-                self.level_models[lv] = [float(y_lv.mean())]
-                continue
-                
-            self.level_models[lv] = [
-                lgb.LGBMClassifier(random_state=s, **self.lgb_params)
-                .fit(X_tr, y_lv)
+        # Fit full runner models on entire train_df
+        if y_tr_8x.sum() >= 15:
+            self.lgb_runner_models = [
+                lgb.LGBMClassifier(random_state=s, **self.lgb_params).fit(X_tr, y_tr_8x)
                 for s in self.seeds
             ]
+            self.cat_runner_models = [
+                cb.CatBoostClassifier(random_seed=s, **self.cb_params).fit(X_tr, y_tr_8x)
+                for s in self.seeds
+            ]
+        else:
+            self.lgb_runner_models = []
+            self.cat_runner_models = []
+            
+        # Compute empirical miss payoffs
+        self.compute_miss_payoffs(train_df)
+
+    def fit_gatekeeper(self, train_df):
+        """Interface compatibility alias."""
+        return self.fit_entry(train_df)
+
+    def fit_levels(self, train_df):
+        """Interface compatibility alias."""
+        pass
+
+    def predict_entry(self, test_df):
+        """Predicts calibrated P(max_x >= 5.0) probability blend."""
+        X_te = test_df[self.feature_cols].astype(float).fillna(0).values
+        p_lgb = np.mean([m.predict_proba(X_te)[:, 1] for m in self.lgb_entry_models], axis=0)
+        p_cat = np.mean([m.predict_proba(X_te)[:, 1] for m in self.cat_entry_models], axis=0)
+        p_raw = 0.5 * p_lgb + 0.5 * p_cat
+        
+        if self.calibrator_5x is not None:
+            return self.calibrator_5x.predict_proba(p_raw.reshape(-1, 1))[:, 1]
+        return p_raw
+
+    def predict_gatekeeper(self, test_df):
+        """Interface compatibility alias."""
+        return self.predict_entry(test_df)
+
+    def predict_runner(self, test_df):
+        """Predicts calibrated P(max_x >= 8.0) probability blend."""
+        X_te = test_df[self.feature_cols].astype(float).fillna(0).values
+        if len(self.lgb_runner_models) > 0 and len(self.cat_runner_models) > 0:
+            p_lgb = np.mean([m.predict_proba(X_te)[:, 1] for m in self.lgb_runner_models], axis=0)
+            p_cat = np.mean([m.predict_proba(X_te)[:, 1] for m in self.cat_runner_models], axis=0)
+            p_raw = 0.5 * p_lgb + 0.5 * p_cat
+        else:
+            p_raw = np.full(len(test_df), 0.02)
+            
+        if self.calibrator_8x is not None:
+            return self.calibrator_8x.predict_proba(p_raw.reshape(-1, 1))[:, 1]
+        return p_raw
 
     def predict_levels(self, test_df):
-        X_te = test_df[self.stage2_cols].astype(float).fillna(0).values
-        probs = np.zeros((len(test_df), len(self.levels)), dtype=float)
-        
-        for j, lv in enumerate(self.levels):
-            models = self.level_models[lv]
-            if isinstance(models[0], (float, int)):
-                probs[:, j] = float(models[0])
-            else:
-                probs[:, j] = np.mean([m.predict_proba(X_te)[:, 1] for m in models], axis=0)
-                
-        probs_monotonic = np.minimum.accumulate(probs, axis=1)
-        return probs_monotonic
+        """Interface compatibility returning [p_5x, p_8x]."""
+        p5 = self.predict_entry(test_df)
+        p8 = self.predict_runner(test_df)
+        p8_mono = np.minimum(p8, p5)
+        return np.column_stack([p5, p8_mono])
 
     def compute_miss_payoffs(self, train_df):
+        """Computes empirical average miss return for 5x and 8x thresholds."""
         mxs = train_df['max_x'].values
         fxs = train_df['final_x'].values if 'final_x' in train_df.columns else train_df['finalx'].values
         held = np.maximum(fxs - 1.0 - self.cost, -1.0)
         
-        held_by_level = []
-        for lv in self.levels:
-            miss = mxs < lv
-            held_by_level.append(float(held[miss].mean()) if miss.any() else -0.95)
-        return np.array(held_by_level, dtype=float)
+        miss_5 = mxs < 5.0
+        miss_8 = mxs < 8.0
+        held_5 = float(held[miss_5].mean()) if miss_5.any() else -0.95
+        held_8 = float(held[miss_8].mean()) if miss_8.any() else -0.95
+        self.miss_payoffs = {'held_5': held_5, 'held_8': held_8}
+        return self.miss_payoffs
 
-    def calculate_expected_values(self, probs_monotonic, held_by_level):
-        win_pnl = self.levels[None, :] - 1.0 - self.cost
-        held_row = held_by_level[None, :]
-        return probs_monotonic * win_pnl + (1.0 - probs_monotonic) * held_row
+    def calculate_expected_values(self, test_df=None, p_levels=None, miss_payoffs=None):
+        """Computes expected PnL for 5x vs 8x exits."""
+        if p_levels is None and test_df is not None:
+            p_levels = self.predict_levels(test_df)
+            
+        p5 = p_levels[:, 0]
+        p8 = p_levels[:, 1]
+        
+        mp = miss_payoffs or self.miss_payoffs
+        h5 = mp.get('held_5', -0.95) if isinstance(mp, dict) else mp[0]
+        h8 = mp.get('held_8', -0.95) if isinstance(mp, dict) else mp[1]
+        
+        # Net win payoffs: 5.0 - 1.0 - 0.3 = +3.70; 8.0 - 1.0 - 0.3 = +6.70
+        ev_5 = p5 * 3.70 + (1.0 - p5) * h5
+        ev_8 = p8 * 6.70 + (1.0 - p8) * h8
+        return np.column_stack([ev_5, ev_8])
 
     def calibrate_scalar_threshold(self, train_df=None, target_daily_trades=2.5):
         """
-        Computes the fixed scalar score cutoff strictly on the holdout training days
-        to target a nominal precision depth of ~2 to 5 trades per day without test peeking.
-        Uses out-of-fold calibrated probabilities to prevent in-sample threshold inflation.
+        Computes the fixed scalar cutoff strictly on the holdout training days (OOF)
+        targeting ~2 to 5 trades per day without test peeking.
         """
         if getattr(self, 'p_cal_oof', None) is not None and self.trn_cal_len > 0:
             avg_tokens_per_day = max(self.trn_cal_len / float(self.cal_days_len), 10.0)
@@ -157,7 +229,7 @@ class TwoStageDecisionEngine:
             d_trn = sorted(train_df.day.unique())
             cal_days = d_trn[-HOLD_DAYS:]
             trn_cal = train_df[train_df.day.isin(cal_days)].reset_index(drop=True)
-            p_cal = self.predict_gatekeeper(trn_cal)
+            p_cal = self.predict_entry(trn_cal)
             avg_tokens_per_day = max(len(trn_cal) / float(len(cal_days)), 10.0)
             q = min(max(target_daily_trades / avg_tokens_per_day, 0.001), 0.05)
             self.tau_scalar = float(np.quantile(p_cal, 1.0 - q))
@@ -165,55 +237,45 @@ class TwoStageDecisionEngine:
             self.tau_scalar = 0.20
         return self.tau_scalar
 
-    def decide_per_token(self, p_gatekeeper, ev_matrix, tau_scalar=None, min_ev_margin=None):
+    def decide_per_token(self, p_entry, ev_matrix, tau_scalar=None, safety_margin=0.35, mode='2tier'):
         """
-        Per-token causal execution rule (ZERO test ranking or peeking):
-        For each incoming token i:
-          Stage 1 (Gatekeeper): If p_gatekeeper[i] >= tau_scalar, allocate long entry.
-          Stage 2 (Exit Selector): tp[i] = argmax_k E[PnL(k)]
+        Per-token causal execution rule (zero test ranking or peeking):
+        For each token i:
+          If p_entry[i] >= tau_scalar:
+             If mode == 'fixed5':
+                 tp[i] = 5.0
+             Else (mode == '2tier'):
+                 Upgrade to tp[i] = 8.0 iff E[PnL(8.0)] > E[PnL(5.0)] + 0.35 SOL safety margin
+                 Else tp[i] = 5.0
           Else:
-              tp[i] = 0.0 (Costless Skip)
+             tp[i] = 0.0 (Costless Skip)
         """
         tau = self.tau_scalar if tau_scalar is None else tau_scalar
-        n = len(p_gatekeeper)
+        n = len(p_entry)
         final_tp = np.zeros(n, dtype=float)
         
-        # Stage 2: Select optimal take profit multiple k* maximizing expected utility
-        best_lv_idx = np.argmax(ev_matrix, axis=1)
-        best_ev = ev_matrix[np.arange(n), best_lv_idx]
-        best_tp = self.levels[best_lv_idx]
+        ev_5 = ev_matrix[:, 0]
+        ev_8 = ev_matrix[:, 1]
         
-        # Stage 1: Causal per-token gatekeeper decision
-        if min_ev_margin is not None:
-            is_buy = (p_gatekeeper >= tau) & (best_ev >= min_ev_margin)
+        is_buy = (p_entry >= tau)
+        
+        if mode == 'fixed5':
+            final_tp[is_buy] = 5.0
         else:
-            is_buy = (p_gatekeeper >= tau)
+            # Constrained 2-tier exit upgrade
+            is_upgrade = is_buy & (ev_8 > (ev_5 + safety_margin))
+            final_tp[is_buy] = 5.0
+            final_tp[is_upgrade] = 8.0
             
-        final_tp[is_buy] = best_tp[is_buy]
-        return final_tp, best_ev
+        return final_tp, ev_5
 
-    def decide(self, p_gatekeeper, ev_matrix, top_n_daily=2, min_prob_hurdle=None, min_ev_margin=0.0):
+    def decide(self, p_entry, ev_matrix, top_n_daily=2, min_prob_hurdle=None, min_ev_margin=0.0):
         """Wrapper maintaining interface compatibility."""
         tau = self.tau_scalar if min_prob_hurdle is None else min_prob_hurdle
-        return self.decide_per_token(p_gatekeeper, ev_matrix, tau_scalar=tau, min_ev_margin=min_ev_margin)
+        return self.decide_per_token(p_entry, ev_matrix, tau_scalar=tau, mode='2tier')
 
 
-# Backwards compatibility aliases
-class MultiLevelExpectedValueEngine(TwoStageDecisionEngine):
-    def fit_predict_levels(self, train_df, test_df):
-        self.fit_levels(train_df)
-        return self.predict_levels(test_df)
-        
-    def compute_held_payoffs(self, train_df):
-        return self.compute_miss_payoffs(train_df)
-
-TwoStageCascadeEnsemble = TwoStageDecisionEngine
-
-def calibrate_decision_threshold(model, train_df, q_depth=1.0):
-    return 1.0 - (q_depth / 100.0)
-
-def make_decisions(scores, threshold, target_k=TARGET_K):
-    return np.where(scores >= threshold, target_k, 0.0)
-
-def optimize_ev_margin(model, train_df, margin_grid=(0.0, 0.10, 0.20), hold_days=HOLD_DAYS):
-    return 0.0
+# Interface compatibility aliases
+TwoStageDecisionEngine = UnifiedTwoTierEngine
+MultiLevelExpectedValueEngine = UnifiedTwoTierEngine
+TwoStageCascadeEnsemble = UnifiedTwoTierEngine

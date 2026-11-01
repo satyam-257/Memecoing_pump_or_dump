@@ -241,11 +241,12 @@ def extract_tape_features(c_df, a_df):
     else:
         F['impact_per_sol'] = 0.0
         
-    # 5. Pre-migration Bonding Curve Dynamics
+    # 5. Pre-migration Bonding Curve Dynamics & Reverted Demand Signals
     if len(c_df) > 0:
         c_ok = c_df[c_df.failed == 0]
         c_failed = c_df[c_df.failed != 0]
         
+        # Strictly enforced failed == 0 for all volume, wallet count, and price calculations
         F['curve_n'] = c_ok.groupby('mint').size().reindex(F.index).fillna(0)
         F['curve_sol'] = c_ok.groupby('mint')['sol'].sum().reindex(F.index).fillna(0.0)
         F['curve_uw'] = c_ok.groupby('mint')['wallet'].nunique().reindex(F.index).fillna(0)
@@ -253,10 +254,17 @@ def extract_tape_features(c_df, a_df):
         F['curve_failed'] = c_failed.groupby('mint').size().reindex(F.index).fillna(0)
         F['curve_failed_ratio'] = F['curve_failed'] / (F['curve_n'] + F['curve_failed']).replace(0, np.nan)
         
+        # High reverted buy attempts indicate fierce bot competition / front-running for hot launches
+        c_failed_buys = c_failed[c_failed.is_buy == 1]
+        F['failed_buy_count'] = c_failed_buys.groupby('mint').size().reindex(F.index).fillna(0)
+        F['failed_to_executed_ratio'] = F['curve_failed'] / (F['curve_n'] + F['curve_failed'] + 1e-4)
+        F['failed_unique_wallets'] = c_failed.groupby('mint')['wallet'].nunique().reindex(F.index).fillna(0)
+        
         p_curve_last = c_ok.groupby('mint')['price'].last()
         F['migration_pop'] = p_first / p_curve_last.replace(0, np.nan)
     else:
-        for col in ['curve_n', 'curve_sol', 'curve_uw', 'curve_dur', 'curve_failed', 'curve_failed_ratio', 'migration_pop']:
+        for col in ['curve_n', 'curve_sol', 'curve_uw', 'curve_dur', 'curve_failed', 'curve_failed_ratio',
+                    'failed_buy_count', 'failed_to_executed_ratio', 'failed_unique_wallets', 'migration_pop']:
             F[col] = 0.0
             
     return F.reset_index().rename(columns={'index': 'mint'})

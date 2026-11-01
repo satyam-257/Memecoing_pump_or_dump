@@ -1,4 +1,5 @@
 """Causal participant and deployer reputation engine with strict 1-hour embargo, 7-day half-life decay, and m-estimate Bayesian shrinkage."""
+import os
 import numpy as np
 import pandas as pd
 from src.config import WIN, TARGET_K
@@ -21,10 +22,12 @@ REPUTATION_COLS = [
     'c_hit_3x', 'c_hit_5x', 'c_last_peak', 'c_time_since_last'
 ]
 
-def build_causal_reputation(tokens_df, amm_edges_df, creator_map=None, target_k=TARGET_K, win=WIN, m_shrinkage=M_SHRINKAGE, base_rate=GLOBAL_BASE_RATE):
+def build_causal_reputation(tokens_df, amm_edges_df, creator_map=None, archive_df=None, target_k=TARGET_K, win=WIN, m_shrinkage=M_SHRINKAGE, base_rate=GLOBAL_BASE_RATE):
     """
     Computes participant and deployer reputation under strict causal ordering:
     - Invariant: Two-pointer 3600s embargo (mts[j] <= cur_t - 3600).
+    - Warm-starts wallet and creator reputation dictionaries using historical archive data
+      prior to the 30-day window so creator and smart-money histories have full lookback depth.
     - Empirical Bayesian Shrinkage (m-estimate smoothing) with m = 5:
         shrunk_rate = (hits + m * base_rate) / (appearances + m)
     - SOL trade size weighting and exponential recency decay (7-day half-life)
@@ -36,7 +39,33 @@ def build_causal_reputation(tokens_df, amm_edges_df, creator_map=None, target_k=
         tok['max_x'] = tokens_df['max_x'].values
     else:
         tok['max_x'] = np.nan
+    target_mints = set(tok['mint'])
         
+    # Warm-start from archive dataset if available
+    if archive_df is None:
+        for candidate in ['data/train_archive.csv', 'train_archive.csv', '/kaggle/input/competitions/memecoins-pump-or-dump/train_archive.csv']:
+            if os.path.exists(candidate):
+                try:
+                    archive_df = pd.read_csv(candidate)
+                    break
+                except Exception:
+                    pass
+                    
+    if archive_df is not None and len(archive_df) > 0:
+        arc = archive_df[['mint', 'mt']].copy()
+        if 'max_x' in archive_df.columns:
+            arc['max_x'] = archive_df['max_x'].values
+        else:
+            arc['max_x'] = np.nan
+        min_t = tok.mt.min()
+        arc = arc[arc.mt < min_t]
+        if len(arc) > 0:
+            tok = pd.concat([arc, tok], ignore_index=True)
+            if creator_map is not None and 'creator' in archive_df.columns:
+                for m, c in zip(archive_df['mint'], archive_df['creator']):
+                    if m not in creator_map:
+                        creator_map[m] = c
+                        
     tok = tok.sort_values('mt', kind='stable').reset_index(drop=True)
     
     # Process wallet edges
@@ -211,4 +240,6 @@ def build_causal_reputation(tokens_df, amm_edges_df, creator_map=None, target_k=
                     
     rep_df = pd.DataFrame(out, columns=REPUTATION_COLS)
     rep_df['mint'] = mints
+    if len(target_mints) < len(rep_df):
+        rep_df = rep_df[rep_df['mint'].isin(target_mints)].reset_index(drop=True)
     return rep_df

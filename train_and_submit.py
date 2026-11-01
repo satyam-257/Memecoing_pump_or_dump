@@ -88,24 +88,21 @@ def main():
     feature_cols = [c for c in TR.columns if c not in exclude_cols and np.issubdtype(TR[c].dtype, np.number)]
     print(f"Total features assembled: {len(feature_cols)}")
     
-    # 4. Decoupled Two-Stage Gatekeeper & Utility Maximizer Training
-    print("\n[4/5] Training Decoupled Two-Stage Engine (Stage 1 Gatekeeper + Stage 2 Utility Optimizer)...")
-    engine = TwoStageDecisionEngine(feature_cols=feature_cols, levels=LEVELS)
+    # 4. Unified Full-Feature Entry Gatekeeper & Constrained 2-Tier Exit Policy
+    print("\n[4/5] Training Unified Entry Classifier (LGBM + CatBoost on P(>=5x)) & Constrained 2-Tier Exit Engine...")
+    engine = TwoStageDecisionEngine(feature_cols=feature_cols)
     
-    engine.fit_gatekeeper(TR)
-    engine.fit_levels(TR)
+    engine.fit_entry(TR)
     
     # 5. Predict on test set
-    print("\n[5/5] Generating calibrated test predictions and selective policy allocation...")
-    test_p_gate = engine.predict_gatekeeper(TE)
-    test_p_levels = engine.predict_levels(TE)
-    miss_payoffs = engine.compute_miss_payoffs(TR)
-    test_ev = engine.calculate_expected_values(test_p_levels, miss_payoffs)
+    print("\n[5/5] Generating calibrated test predictions and constrained 2-tier exit allocation...")
+    test_p_entry = engine.predict_entry(TE)
+    test_ev = engine.calculate_expected_values(test_df=TE)
     
     # Causal per-token execution rule (zero test ranking or peeking)
     tau_scalar = engine.calibrate_scalar_threshold(TR, target_daily_trades=2.5)
     print(f"Calibrated causal Stage 1 scalar cutoff on last 5 training days: tau = {tau_scalar:.4f}")
-    test_tp, best_ev = engine.decide_per_token(test_p_gate, test_ev, tau_scalar=tau_scalar)
+    test_tp, best_ev = engine.decide_per_token(test_p_entry, test_ev, tau_scalar=tau_scalar, safety_margin=0.35, mode='2tier')
     
     # Build verified submission dataframe
     sub = pd.DataFrame({
