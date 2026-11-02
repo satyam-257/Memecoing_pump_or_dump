@@ -104,7 +104,7 @@ def main():
     # Causal per-token execution rule (zero test ranking or peeking)
     tau_scalar = engine.calibrate_scalar_threshold(TR, target_daily_trades=2.5)
     print(f"Calibrated causal Stage 1 scalar cutoff on last 5 training days: tau = {tau_scalar:.4f}")
-    test_tp, best_ev = engine.decide_per_token(TE, ev_matrix=test_ev, p_entry=test_p, tau_scalar=tau_scalar, safety_margin=0.15, mode='continuous')
+    test_tp, best_ev = engine.decide_per_token(TE, ev_matrix=test_ev, p_entry=test_p, tau_scalar=tau_scalar, mode='fixed5')
     
     # Build verified submission dataframe
     sub = pd.DataFrame({

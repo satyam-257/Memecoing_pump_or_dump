@@ -740,7 +740,26 @@ cells.append(nbf.v4.new_markdown_cell("""## 4. 6-Model Seed Ensemble, Terminal F
 - **Rug-Risk Veto**: Vetoes entry ($tp = 0.0$) if $\\hat{h} < -0.92$ and `dev_sell_ratio > 0.5`.
 """))
 
-cells.append(nbf.v4.new_code_cell("""TP_GRID = [3.8, 4.5, 5.0, 6.0, 7.5, 10.0]
+cells.append(nbf.v4.new_code_cell("""TP_GRID = [5.0, 6.0, 7.5, 10.0]
+
+def compute_sample_weights(df, cost=COST):
+    mxs = df['max_x'].values
+    fxs = df['final_x'].values if 'final_x' in df.columns else df['finalx'].values
+    days = df['day'].values if 'day' in df.columns else np.zeros(len(df))
+    unique_days = sorted(np.unique(days))
+    recent_10_days = set(unique_days[-10:]) if len(unique_days) >= 10 else set(unique_days)
+    
+    is_win = (mxs >= 5.0)
+    weights = np.zeros(len(df), dtype=float)
+    is_recent = np.isin(days, list(recent_10_days))
+    recency_boost = np.where(is_recent, 1.25, 1.0)
+    weights[is_win] = 3.70 * recency_boost[is_win]
+    
+    pnl_loss = np.clip(fxs - 1.0 - cost, -1.0, 0.0)
+    loss_weights = np.abs(pnl_loss)
+    weights[~is_win] = np.maximum(loss_weights[~is_win], 0.10)
+    weights = weights / np.mean(weights)
+    return weights
 SEEDS_3 = [42, 101, 777]
 
 LGB_PARAMS_OPT = dict(
@@ -753,14 +772,19 @@ CB_PARAMS_OPT = dict(
 )
 
 class UnifiedSurvivalEngine:
-    def __init__(self, feature_cols, seeds=SEEDS_3, lgb_params=None, cb_params=None, cost=COST, tp_grid=None):
+    def __init__(self, feature_cols, seeds=SEEDS_3, lgb_params=None, cb_params=None, cost=COST, tp_grid=None, cost_sensitive=True, regime_adaptive=True, fit_survival=False):
         self.feature_cols = list(feature_cols)
         self.seeds = seeds if len(seeds) > 0 else [42]
         self.lgb_params = lgb_params or LGB_PARAMS_OPT
         self.cb_params = cb_params or CB_PARAMS_OPT
         self.cost = cost
         self.tp_grid = tp_grid or TP_GRID
-        self.idx_5 = self.tp_grid.index(5.0) if 5.0 in self.tp_grid else 2
+        self.idx_5 = self.tp_grid.index(5.0) if 5.0 in self.tp_grid else 0
+        self.cost_sensitive = cost_sensitive
+        self.regime_adaptive = regime_adaptive
+        self.fit_survival = fit_survival
+        self.is_cold_regime = False
+        self.trn_cal_df = None
         
         self.lgb_entry_models = []
         self.cat_entry_models = []
@@ -796,10 +820,12 @@ class UnifiedSurvivalEngine:
             mxs_cal = trn_cal['max_x'].values
             y_cal_5x = (mxs_cal >= 5.0).astype(int)
             
+            self.trn_cal_df = trn_cal
+            w_old = compute_sample_weights(trn_old, self.cost) if self.cost_sensitive else None
             oof_5_preds = []
             for s in self.seeds:
-                m_lgb = lgb.LGBMClassifier(random_state=s, **self.lgb_params).fit(X_old, y_old_5x)
-                m_cb = cb.CatBoostClassifier(random_seed=s, **self.cb_params).fit(X_old, y_old_5x)
+                m_lgb = lgb.LGBMClassifier(random_state=s, **self.lgb_params).fit(X_old, y_old_5x, sample_weight=w_old)
+                m_cb = cb.CatBoostClassifier(random_seed=s, **self.cb_params).fit(X_old, y_old_5x, sample_weight=w_old)
                 oof_5_preds.append(m_lgb.predict_proba(X_cal)[:, 1])
                 oof_5_preds.append(m_cb.predict_proba(X_cal)[:, 1])
                 
@@ -826,12 +852,13 @@ class UnifiedSurvivalEngine:
             self.trn_cal_len = 0
             self.cal_days_len = 0
             
+        w_tr = compute_sample_weights(train_df, self.cost) if self.cost_sensitive else None
         self.lgb_entry_models = [
-            lgb.LGBMClassifier(random_state=s, **self.lgb_params).fit(X_tr, y_tr_5x)
+            lgb.LGBMClassifier(random_state=s, **self.lgb_params).fit(X_tr, y_tr_5x, sample_weight=w_tr)
             for s in self.seeds
         ]
         self.cat_entry_models = [
-            cb.CatBoostClassifier(random_seed=s, **self.cb_params).fit(X_tr, y_tr_5x)
+            cb.CatBoostClassifier(random_seed=s, **self.cb_params).fit(X_tr, y_tr_5x, sample_weight=w_tr)
             for s in self.seeds
         ]
         
@@ -917,17 +944,42 @@ class UnifiedSurvivalEngine:
         return ev_matrix
 
     def calibrate_scalar_threshold(self, train_df=None, target_daily_trades=2.5):
+        trn_cal = getattr(self, 'trn_cal_df', None)
+        if trn_cal is None and train_df is not None:
+            d_trn = sorted(train_df.day.unique())
+            cal_days = d_trn[-HOLD_DAYS:]
+            trn_cal = train_df[train_df.day.isin(cal_days)].reset_index(drop=True)
+            self.trn_cal_len = len(trn_cal)
+            self.cal_days_len = len(cal_days)
+            
+        if trn_cal is not None and len(trn_cal) > 0 and 'max_x' in trn_cal.columns:
+            base_rate_5x = float((trn_cal['max_x'].values >= 5.0).mean())
+            self.is_cold_regime = (base_rate_5x < 0.055)
+        else:
+            self.is_cold_regime = False
+            
+        target_trades = target_daily_trades
+        if self.regime_adaptive and self.is_cold_regime:
+            target_trades = 1.25
+            
         if getattr(self, 'p_cal_oof', None) is not None and self.trn_cal_len > 0:
-            avg_tokens_per_day = max(self.trn_cal_len / float(self.cal_days_len), 10.0)
-            q = min(max(target_daily_trades / avg_tokens_per_day, 0.001), 0.05)
-            self.tau_scalar = float(np.quantile(self.p_cal_oof, 1.0 - q))
+            p_cal = self.p_cal_oof.copy()
+            if trn_cal is not None and len(trn_cal) == len(p_cal):
+                hh_cal = self.predict_hold(trn_cal)
+                ds_cal = trn_cal['dev_sell_ratio'].values if 'dev_sell_ratio' in trn_cal.columns else np.zeros(len(trn_cal))
+                veto_cal = (hh_cal < -0.92) & (ds_cal > 0.5)
+                if (~veto_cal).sum() >= 20:
+                    p_cal = p_cal[~veto_cal]
+            avg_tokens_per_day = max(len(p_cal) / float(self.cal_days_len), 10.0)
+            q = min(max(target_trades / avg_tokens_per_day, 0.001), 0.05)
+            self.tau_scalar = float(np.quantile(p_cal, 1.0 - q))
         elif train_df is not None:
             d_trn = sorted(train_df.day.unique())
             cal_days = d_trn[-HOLD_DAYS:]
             trn_cal = train_df[train_df.day.isin(cal_days)].reset_index(drop=True)
             p_cal = self.predict_entry(trn_cal)
             avg_tokens_per_day = max(len(trn_cal) / float(len(cal_days)), 10.0)
-            q = min(max(target_daily_trades / avg_tokens_per_day, 0.001), 0.05)
+            q = min(max(target_trades / avg_tokens_per_day, 0.001), 0.05)
             self.tau_scalar = float(np.quantile(p_cal, 1.0 - q))
         else:
             self.tau_scalar = 0.05
@@ -946,6 +998,10 @@ class UnifiedSurvivalEngine:
         
         is_candidate = (p_entry >= tau)
         is_vetoed = (hat_hold < -0.92) & (dev_sell > 0.5)
+        if self.regime_adaptive and getattr(self, 'is_cold_regime', False):
+            ev_5_eval = p_entry * (5.0 - 1.0 - self.cost) + (1.0 - p_entry) * hat_hold
+            cold_veto = (ev_5_eval < 0.45)
+            is_vetoed = is_vetoed | cold_veto
         ev_5 = ev_matrix[:, self.idx_5]
         
         for i in range(n):
@@ -1082,7 +1138,7 @@ test_ev = prod_engine.calculate_expected_values(test_df=TE)
 tau_scalar = prod_engine.calibrate_scalar_threshold(TR, target_daily_trades=2.5)
 print(f"Calibrated causal scalar cutoff: tau = {tau_scalar:.4f}")
 
-test_tp, best_ev = prod_engine.decide_per_token(TE, ev_matrix=test_ev, tau_scalar=tau_scalar, safety_margin=0.15, mode='continuous')
+test_tp, best_ev = prod_engine.decide_per_token(TE, ev_matrix=test_ev, tau_scalar=tau_scalar, mode='fixed5')
 
 sub = pd.DataFrame({'mint': TE['mint'], 'tp': test_tp})
 
