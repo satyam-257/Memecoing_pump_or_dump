@@ -48,11 +48,13 @@ def main():
     
     if os.path.exists(c_sample) and os.path.exists(a_sample):
         print("  Processing local sample tapes with direction disambiguation & Gini...")
-        c_cols = [c for c in CURVE_COLS if c not in ('slot', 'tx_idx')] + ['mint', 'failed', 'new_price', 'sol', 'ts_rel']
-        a_cols = [c for c in AMM_COLS if c not in ('slot', 'tx_idx')] + ['mint', 'direction', 'base_token', 'new_price', 'sol', 'ts_rel', 'signing_wallet', 'fee_payer']
+        c_avail = pd.read_csv(c_sample, nrows=1).columns
+        a_avail = pd.read_csv(a_sample, nrows=1).columns
+        c_cols = [c for c in CURVE_COLS if c in c_avail] + [c for c in ['slot', 'tx_idx', 'signature'] if c in c_avail and c not in CURVE_COLS]
+        a_cols = [c for c in AMM_COLS if c in a_avail] + [c for c in ['slot', 'tx_idx', 'signature'] if c in a_avail and c not in AMM_COLS]
         
-        c_df = pd.read_csv(c_sample, usecols=[c for c in c_cols if c in pd.read_csv(c_sample, nrows=1).columns])
-        a_df = pd.read_csv(a_sample, usecols=[c for c in a_cols if c in pd.read_csv(a_sample, nrows=1).columns])
+        c_df = pd.read_csv(c_sample, usecols=list(set(c_cols)))
+        a_df = pd.read_csv(a_sample, usecols=list(set(a_cols)))
         
         tape_features_df = extract_tape_features(c_df, a_df)
         
@@ -88,21 +90,21 @@ def main():
     feature_cols = [c for c in TR.columns if c not in exclude_cols and np.issubdtype(TR[c].dtype, np.number)]
     print(f"Total features assembled: {len(feature_cols)}")
     
-    # 4. Unified Full-Feature Entry Gatekeeper & Constrained 2-Tier Exit Policy
-    print("\n[4/5] Training Unified Entry Classifier (LGBM + CatBoost on P(>=5x)) & Constrained 2-Tier Exit Engine...")
+    # 4. 6-Model Seed Ensemble, Terminal Floor Regressor, & Continuous TP Grid
+    print("\n[4/5] Training 6-Model Seed Ensemble (3x LGBM + 3x CatBoost on P(>=5x)), Terminal Floor Regressor, & Survival Grid...")
     engine = TwoStageDecisionEngine(feature_cols=feature_cols)
     
     engine.fit_entry(TR)
     
     # 5. Predict on test set
-    print("\n[5/5] Generating calibrated test predictions and constrained 2-tier exit allocation...")
-    test_p_entry = engine.predict_entry(TE)
+    print("\n[5/5] Generating calibrated test expected values and continuous TP allocation...")
+    test_p = engine.predict_entry(TE)
     test_ev = engine.calculate_expected_values(test_df=TE)
     
     # Causal per-token execution rule (zero test ranking or peeking)
     tau_scalar = engine.calibrate_scalar_threshold(TR, target_daily_trades=2.5)
     print(f"Calibrated causal Stage 1 scalar cutoff on last 5 training days: tau = {tau_scalar:.4f}")
-    test_tp, best_ev = engine.decide_per_token(test_p_entry, test_ev, tau_scalar=tau_scalar, safety_margin=0.35, mode='2tier')
+    test_tp, best_ev = engine.decide_per_token(TE, ev_matrix=test_ev, p_entry=test_p, tau_scalar=tau_scalar, safety_margin=0.15, mode='continuous')
     
     # Build verified submission dataframe
     sub = pd.DataFrame({

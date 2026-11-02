@@ -34,10 +34,14 @@ def extract_tape_features(c_df, a_df):
     if 'signing_wallet' in a_df.columns:
         a_df = a_df.rename(columns={'signing_wallet': 'wallet'})
         
-    # Maintain strict blockchain transaction ordering: slot, tx_idx
+    # Maintain strict blockchain transaction ordering: slot, tx_idx (never re-sort by ts or block_time)
     sort_cols = [c for c in ['mint', 'slot', 'tx_idx'] if c in a_df.columns]
     if sort_cols:
         a_df = a_df.sort_values(sort_cols, kind='mergesort')
+        
+    sort_cols_c = [c for c in ['mint', 'slot', 'tx_idx'] if c in c_df.columns]
+    if sort_cols_c:
+        c_df = c_df.sort_values(sort_cols_c, kind='mergesort')
         
     # Price initialization
     for df in (c_df, a_df):
@@ -199,6 +203,26 @@ def extract_tape_features(c_df, a_df):
     F['fee_mismatch_rate'] = a_df.groupby('mint')['mismatch'].mean().reindex(F.index).fillna(0.0)
     F['creator_sell_sol'] = a_df.groupby('mint')['creator_sell_sol'].sum().reindex(F.index).fillna(0.0)
     F['creator_buy_sol'] = a_df.groupby('mint')['creator_buy_sol'].sum().reindex(F.index).fillna(0.0)
+    creator_tot_sol = F['creator_sell_sol'] + F['creator_buy_sol']
+    F['dev_sell_ratio'] = np.where(creator_tot_sol > 0, F['creator_sell_sol'] / (creator_tot_sol + 1e-4),
+                                   np.where(F['creator_sell_sol'] > 0, 1.0, 0.0))
+    
+    # Multi-swap transaction metrics (MEV bundling / loop detection vs organic retail)
+    if 'signature' in a_df.columns:
+        tx_keys = ['mint', 'signature']
+    elif 'slot' in a_df.columns and 'tx_idx' in a_df.columns:
+        tx_keys = ['mint', 'slot', 'tx_idx']
+    else:
+        tx_keys = None
+        
+    if tx_keys is not None:
+        tx_counts = a_df.groupby(tx_keys).size()
+        is_multi = (tx_counts > 1).astype(float)
+        F['multi_swap_tx_ratio'] = is_multi.groupby('mint').mean().reindex(F.index).fillna(0.0)
+        F['max_swaps_per_tx'] = tx_counts.groupby('mint').max().reindex(F.index).fillna(1.0)
+    else:
+        F['multi_swap_tx_ratio'] = 0.0
+        F['max_swaps_per_tx'] = 1.0
     
     # Whale order metrics
     buys = a_df[a_df.is_buy == 1]
@@ -260,11 +284,30 @@ def extract_tape_features(c_df, a_df):
         F['failed_to_executed_ratio'] = F['curve_failed'] / (F['curve_n'] + F['curve_failed'] + 1e-4)
         F['failed_unique_wallets'] = c_failed.groupby('mint')['wallet'].nunique().reindex(F.index).fillna(0)
         
+        # Retention of bonding curve buyers into AMM first 60s
+        c_buys = c_ok[c_ok.is_buy == 1]
+        c_wallets = c_buys.groupby('mint')['wallet'].apply(set)
+        a_60 = a_df[a_df.ts_rel <= 60]
+        a_buys = a_60[a_60.is_buy == 1]
+        a_sells = a_60[a_60.is_buy == 0]
+        a_buy_w = a_buys.groupby('mint')['wallet'].apply(set)
+        a_sell_w = a_sells.groupby('mint')['wallet'].apply(set)
+        retention_dict = {}
+        for m in F.index:
+            cw = c_wallets.get(m, set())
+            if len(cw) == 0:
+                retention_dict[m] = 0.0
+            else:
+                dumped = cw & (a_sell_w.get(m, set()) - a_buy_w.get(m, set()))
+                retained = len(cw) - len(dumped)
+                retention_dict[m] = float(retained / len(cw))
+        F['curve_to_amm_retention'] = pd.Series(retention_dict).reindex(F.index).fillna(0.0)
+        
         p_curve_last = c_ok.groupby('mint')['price'].last()
         F['migration_pop'] = p_first / p_curve_last.replace(0, np.nan)
     else:
         for col in ['curve_n', 'curve_sol', 'curve_uw', 'curve_dur', 'curve_failed', 'curve_failed_ratio',
-                    'failed_buy_count', 'failed_to_executed_ratio', 'failed_unique_wallets', 'migration_pop']:
+                    'failed_buy_count', 'failed_to_executed_ratio', 'failed_unique_wallets', 'curve_to_amm_retention', 'migration_pop']:
             F[col] = 0.0
             
     return F.reset_index().rename(columns={'index': 'mint'})

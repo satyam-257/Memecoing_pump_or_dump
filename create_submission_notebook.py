@@ -349,6 +349,26 @@ def tape_features(c_df, a_df):
     F['fee_mismatch_rate'] = a_df.groupby('mint')['mismatch'].mean().reindex(F.index).fillna(0.0)
     F['creator_sell_sol'] = a_df.groupby('mint')['creator_sell_sol'].sum().reindex(F.index).fillna(0.0)
     F['creator_buy_sol'] = a_df.groupby('mint')['creator_buy_sol'].sum().reindex(F.index).fillna(0.0)
+    creator_tot_sol = F['creator_sell_sol'] + F['creator_buy_sol']
+    F['dev_sell_ratio'] = np.where(creator_tot_sol > 0, F['creator_sell_sol'] / (creator_tot_sol + 1e-4),
+                                   np.where(F['creator_sell_sol'] > 0, 1.0, 0.0))
+    
+    # Multi-swap transaction metrics (MEV bundling / loop detection vs organic retail)
+    if 'signature' in a_df.columns:
+        tx_keys = ['mint', 'signature']
+    elif 'slot' in a_df.columns and 'tx_idx' in a_df.columns:
+        tx_keys = ['mint', 'slot', 'tx_idx']
+    else:
+        tx_keys = None
+        
+    if tx_keys is not None:
+        tx_counts = a_df.groupby(tx_keys).size()
+        is_multi = (tx_counts > 1).astype(float)
+        F['multi_swap_tx_ratio'] = is_multi.groupby('mint').mean().reindex(F.index).fillna(0.0)
+        F['max_swaps_per_tx'] = tx_counts.groupby('mint').max().reindex(F.index).fillna(1.0)
+    else:
+        F['multi_swap_tx_ratio'] = 0.0
+        F['max_swaps_per_tx'] = 1.0
     
     buys = a_df[a_df.is_buy == 1]
     F['buy_max'] = buys.groupby('mint')['sol'].max().reindex(F.index).fillna(0.0)
@@ -402,11 +422,30 @@ def tape_features(c_df, a_df):
         F['failed_to_executed_ratio'] = F['curve_failed'] / (F['curve_n'] + F['curve_failed'] + 1e-4)
         F['failed_unique_wallets'] = c_failed.groupby('mint')['wallet'].nunique().reindex(F.index).fillna(0)
         
+        # Retention of bonding curve buyers into AMM first 60s
+        c_buys = c_ok[c_ok.is_buy == 1]
+        c_wallets = c_buys.groupby('mint')['wallet'].apply(set)
+        a_60 = a_df[a_df.ts_rel <= 60]
+        a_buys = a_60[a_60.is_buy == 1]
+        a_sells = a_60[a_60.is_buy == 0]
+        a_buy_w = a_buys.groupby('mint')['wallet'].apply(set)
+        a_sell_w = a_sells.groupby('mint')['wallet'].apply(set)
+        retention_dict = {}
+        for m in F.index:
+            cw = c_wallets.get(m, set())
+            if len(cw) == 0:
+                retention_dict[m] = 0.0
+            else:
+                dumped = cw & (a_sell_w.get(m, set()) - a_buy_w.get(m, set()))
+                retained = len(cw) - len(dumped)
+                retention_dict[m] = float(retained / len(cw))
+        F['curve_to_amm_retention'] = pd.Series(retention_dict).reindex(F.index).fillna(0.0)
+        
         p_curve_last = c_ok.groupby('mint')['price'].last()
         F['migration_pop'] = p_first / p_curve_last.replace(0, np.nan)
     else:
         for col in ['curve_n', 'curve_sol', 'curve_uw', 'curve_dur', 'curve_failed', 'curve_failed_ratio',
-                    'failed_buy_count', 'failed_to_executed_ratio', 'failed_unique_wallets', 'migration_pop']:
+                    'failed_buy_count', 'failed_to_executed_ratio', 'failed_unique_wallets', 'curve_to_amm_retention', 'migration_pop']:
             F[col] = 0.0
             
     return F.reset_index().rename(columns={'index': 'mint'})
@@ -690,51 +729,57 @@ FE = [c for c in TR.columns if c not in exclude and np.issubdtype(TR[c].dtype, n
 print(f"Final feature space: {len(FE)} features.")
 """))
 
-# Cell 6: Unified Entry Gatekeeper & Constrained 2-Tier Exit Utility Engine
-cells.append(nbf.v4.new_markdown_cell("""## 4. Unified Full-Feature Entry Gatekeeper & Constrained 2-Tier Exit Utility Engine
-- **Primary Entry Classifier**: Receives all features simultaneously (Creation Bundles + Tape Velocity + Shrunk Wallet Reputation).
-- **Target**: Directly predicts $P(\\max(X) \\ge 5.0)$ matching high-conviction $+3.70$ SOL net payout sweet spot.
-- **Ensemble Blend**: Blends LightGBM + CatBoost probabilities with out-of-fold calibration on recent training days.
-- **Constrained 2-Tier Exit Policy**: Default $tp = 5.0$; upgrades to $tp = 8.0$ (+6.70 SOL payout) iff $\\mathbb{E}[\\text{PnL}(8.0)] > \\mathbb{E}[\\text{PnL}(5.0)] + 0.35$ SOL safety margin.
-- **Per-Token Thresholding**: Fixed scalar cutoff $\\tau^*$ calibrated on last 5 training days (~2 to 5 trades/day) strictly without test peeking.
+# Cell 6: 6-Model Seed Ensemble, Terminal Floor Regressor, & Continuous Monotonic TP Grid
+cells.append(nbf.v4.new_markdown_cell("""## 4. 6-Model Seed Ensemble, Terminal Floor Regressor, & Continuous TP Grid Engine
+- **6-Model Seed Ensemble**: 3x LightGBM + 3x CatBoost on $P(\\max(X) \\ge 5.0)$ across seeds (42, 101, 777) with out-of-fold calibration to eliminate seed variance.
+- **Terminal Floor Regressor (`hat_hold`)**: Predicts expected terminal floor $\\hat{h} = \\max(\\text{final\\_x} - 1.3, -1.0)$ on tokens that fail to reach target.
+- **Monotonic Survival Curve**: Evaluates $P(\\max(X) \\ge k)$ across $k \\in \\{3.8, 4.5, 5.0, 6.0, 7.5, 10.0\\}$ with strict isotonic constraints $P(k_1) \\ge P(k_2)$ for $k_1 < k_2$, anchored on the calibrated 5x ensemble.
+- **Expected Utility Maximizer**:
+  $$\\mathbb{E}[\\text{PnL}(k)] = P(\\max(X) \\ge k) \\cdot (k - 1.3) + (1 - P(\\max(X) \\ge k)) \\cdot \\hat{h}$$
+  Assigns $tp^* = \\text{argmax}_k \\mathbb{E}[\\text{PnL}(k)]$, defaulting to 5.0 unless another level beats 5.0 by $\\ge 0.15$ SOL.
+- **Rug-Risk Veto**: Vetoes entry ($tp = 0.0$) if $\\hat{h} < -0.92$ and `dev_sell_ratio > 0.5`.
 """))
 
-cells.append(nbf.v4.new_code_cell("""LGB_PARAMS = dict(
-    n_estimators=350, learning_rate=0.04, num_leaves=31, min_child_samples=40,
+cells.append(nbf.v4.new_code_cell("""TP_GRID = [3.8, 4.5, 5.0, 6.0, 7.5, 10.0]
+SEEDS_3 = [42, 101, 777]
+
+LGB_PARAMS_OPT = dict(
+    n_estimators=300, learning_rate=0.04, num_leaves=31, min_child_samples=40,
     subsample=0.80, subsample_freq=1, colsample_bytree=0.70, verbose=-1, n_jobs=-1
 )
 
-CB_PARAMS = dict(
-    iterations=250, learning_rate=0.05, depth=6, thread_count=-1, verbose=0
+CB_PARAMS_OPT = dict(
+    iterations=200, learning_rate=0.06, depth=5, thread_count=-1, verbose=0
 )
 
-class UnifiedTwoTierEngine:
-    def __init__(self, feature_cols, seeds=SEEDS[:2], lgb_params=LGB_PARAMS, cb_params=CB_PARAMS, cost=COST):
+class UnifiedSurvivalEngine:
+    def __init__(self, feature_cols, seeds=SEEDS_3, lgb_params=None, cb_params=None, cost=COST, tp_grid=None):
         self.feature_cols = list(feature_cols)
-        self.seeds = seeds
-        self.lgb_params = lgb_params
-        self.cb_params = cb_params
+        self.seeds = seeds if len(seeds) > 0 else [42]
+        self.lgb_params = lgb_params or LGB_PARAMS_OPT
+        self.cb_params = cb_params or CB_PARAMS_OPT
         self.cost = cost
+        self.tp_grid = tp_grid or TP_GRID
+        self.idx_5 = self.tp_grid.index(5.0) if 5.0 in self.tp_grid else 2
         
         self.lgb_entry_models = []
         self.cat_entry_models = []
-        self.lgb_runner_models = []
-        self.cat_runner_models = []
-        
+        self.level_models = {k: [] for k in self.tp_grid if k != 5.0}
+        self.hold_regressor = None
         self.calibrator_5x = None
-        self.calibrator_8x = None
         self.p_cal_oof = None
+        self.best_ev_cal_oof = None
         self.trn_cal_len = 0
         self.cal_days_len = 0
-        self.tau_scalar = 0.20
-        self.miss_payoffs = {'held_5': -0.95, 'held_8': -0.95}
+        self.tau_scalar = 0.0
 
     def fit_entry(self, train_df):
         X_tr = train_df[self.feature_cols].astype(float).fillna(0).values
-        y_tr_5x = (train_df['max_x'].values >= 5.0).astype(int)
-        y_tr_8x = (train_df['max_x'].values >= 8.0).astype(int)
+        mxs_tr = train_df['max_x'].values
+        fxs_tr = train_df['final_x'].values if 'final_x' in train_df.columns else train_df['finalx'].values
+        y_tr_5x = (mxs_tr >= 5.0).astype(int)
+        y_hold_tr = np.clip(fxs_tr - 1.0 - self.cost, -1.0, 0.0)
         
-        # Out-of-fold calibration on recent holdout days
         d_trn = sorted(train_df.day.unique())
         cal_days = d_trn[-HOLD_DAYS:]
         trn_cal = train_df[train_df.day.isin(cal_days)].reset_index(drop=True)
@@ -742,47 +787,45 @@ class UnifiedTwoTierEngine:
         
         if len(trn_old) >= 500 and len(trn_cal) >= 10:
             X_old = trn_old[self.feature_cols].astype(float).fillna(0).values
-            y_old_5x = (trn_old['max_x'].values >= 5.0).astype(int)
-            y_old_8x = (trn_old['max_x'].values >= 8.0).astype(int)
+            mxs_old = trn_old['max_x'].values
+            fxs_old = trn_old['final_x'].values if 'final_x' in trn_old.columns else trn_old['finalx'].values
+            y_old_5x = (mxs_old >= 5.0).astype(int)
+            y_old_hold = np.clip(fxs_old - 1.0 - self.cost, -1.0, 0.0)
+            
             X_cal = trn_cal[self.feature_cols].astype(float).fillna(0).values
-            y_cal_5x = (trn_cal['max_x'].values >= 5.0).astype(int)
-            y_cal_8x = (trn_cal['max_x'].values >= 8.0).astype(int)
+            mxs_cal = trn_cal['max_x'].values
+            y_cal_5x = (mxs_cal >= 5.0).astype(int)
             
             oof_5_preds = []
-            oof_8_preds = []
             for s in self.seeds:
-                m_lgb5 = lgb.LGBMClassifier(random_state=s, **self.lgb_params).fit(X_old, y_old_5x)
-                m_cb5 = cb.CatBoostClassifier(random_seed=s, **self.cb_params).fit(X_old, y_old_5x)
-                oof_5_preds.append(0.5 * m_lgb5.predict_proba(X_cal)[:, 1] + 0.5 * m_cb5.predict_proba(X_cal)[:, 1])
+                m_lgb = lgb.LGBMClassifier(random_state=s, **self.lgb_params).fit(X_old, y_old_5x)
+                m_cb = cb.CatBoostClassifier(random_seed=s, **self.cb_params).fit(X_old, y_old_5x)
+                oof_5_preds.append(m_lgb.predict_proba(X_cal)[:, 1])
+                oof_5_preds.append(m_cb.predict_proba(X_cal)[:, 1])
                 
-                if y_old_8x.sum() >= 10:
-                    m_lgb8 = lgb.LGBMClassifier(random_state=s, **self.lgb_params).fit(X_old, y_old_8x)
-                    m_cb8 = cb.CatBoostClassifier(random_seed=s, **self.cb_params).fit(X_old, y_old_8x)
-                    oof_8_preds.append(0.5 * m_lgb8.predict_proba(X_cal)[:, 1] + 0.5 * m_cb8.predict_proba(X_cal)[:, 1])
-                else:
-                    oof_8_preds.append(np.full(len(X_cal), float(y_old_8x.mean())))
-                    
             p_oof_5x_raw = np.mean(oof_5_preds, axis=0)
-            p_oof_8x_raw = np.mean(oof_8_preds, axis=0)
-            
             self.calibrator_5x = LogisticRegression().fit(p_oof_5x_raw.reshape(-1, 1), y_cal_5x)
-            self.p_cal_oof = self.calibrator_5x.predict_proba(p_oof_5x_raw.reshape(-1, 1))[:, 1]
+            p_cal_oof_5x = self.calibrator_5x.predict_proba(p_oof_5x_raw.reshape(-1, 1))[:, 1]
+            self.p_cal_oof = p_cal_oof_5x
             
-            if y_cal_8x.sum() >= 5:
-                self.calibrator_8x = LogisticRegression().fit(p_oof_8x_raw.reshape(-1, 1), y_cal_8x)
-            else:
-                self.calibrator_8x = None
-                
+            mask_old_miss = (mxs_old < 5.0)
+            oof_hold_reg = lgb.LGBMRegressor(
+                n_estimators=100, learning_rate=0.05, max_depth=4, num_leaves=15,
+                subsample=0.8, colsample_bytree=0.7, random_state=42, verbose=-1, n_jobs=-1
+            ).fit(X_old[mask_old_miss], y_old_hold[mask_old_miss])
+            hat_hold_cal = np.clip(oof_hold_reg.predict(X_cal), -1.0, 0.0)
+            
+            ev_cal_5x = p_cal_oof_5x * (5.0 - 1.0 - self.cost) + (1.0 - p_cal_oof_5x) * hat_hold_cal
+            self.best_ev_cal_oof = ev_cal_5x
             self.trn_cal_len = len(trn_cal)
             self.cal_days_len = len(cal_days)
         else:
             self.calibrator_5x = None
-            self.calibrator_8x = None
             self.p_cal_oof = None
+            self.best_ev_cal_oof = None
             self.trn_cal_len = 0
             self.cal_days_len = 0
             
-        # Full production models
         self.lgb_entry_models = [
             lgb.LGBMClassifier(random_state=s, **self.lgb_params).fit(X_tr, y_tr_5x)
             for s in self.seeds
@@ -792,20 +835,23 @@ class UnifiedTwoTierEngine:
             for s in self.seeds
         ]
         
-        if y_tr_8x.sum() >= 15:
-            self.lgb_runner_models = [
-                lgb.LGBMClassifier(random_state=s, **self.lgb_params).fit(X_tr, y_tr_8x)
-                for s in self.seeds
-            ]
-            self.cat_runner_models = [
-                cb.CatBoostClassifier(random_seed=s, **self.cb_params).fit(X_tr, y_tr_8x)
-                for s in self.seeds
-            ]
-        else:
-            self.lgb_runner_models = []
-            self.cat_runner_models = []
-            
-        self.compute_miss_payoffs(train_df)
+        mask_miss = (mxs_tr < 5.0)
+        self.hold_regressor = lgb.LGBMRegressor(
+            n_estimators=150, learning_rate=0.05, max_depth=5, num_leaves=20,
+            subsample=0.8, colsample_bytree=0.7, random_state=42, verbose=-1, n_jobs=-1
+        ).fit(X_tr[mask_miss], y_hold_tr[mask_miss])
+        
+        for k in self.tp_grid:
+            if k == 5.0:
+                continue
+            y_k = (mxs_tr >= k).astype(int)
+            if y_k.sum() >= 15:
+                self.level_models[k] = [
+                    lgb.LGBMClassifier(random_state=s, **self.lgb_params).fit(X_tr, y_k)
+                    for s in self.seeds[:2]
+                ]
+            else:
+                self.level_models[k] = [float(y_k.mean())]
 
     def fit_gatekeeper(self, train_df):
         return self.fit_entry(train_df)
@@ -815,9 +861,12 @@ class UnifiedTwoTierEngine:
 
     def predict_entry(self, test_df):
         X_te = test_df[self.feature_cols].astype(float).fillna(0).values
-        p_lgb = np.mean([m.predict_proba(X_te)[:, 1] for m in self.lgb_entry_models], axis=0)
-        p_cat = np.mean([m.predict_proba(X_te)[:, 1] for m in self.cat_entry_models], axis=0)
-        p_raw = 0.5 * p_lgb + 0.5 * p_cat
+        preds = []
+        for m in self.lgb_entry_models:
+            preds.append(m.predict_proba(X_te)[:, 1])
+        for m in self.cat_entry_models:
+            preds.append(m.predict_proba(X_te)[:, 1])
+        p_raw = np.mean(preds, axis=0)
         if self.calibrator_5x is not None:
             return self.calibrator_5x.predict_proba(p_raw.reshape(-1, 1))[:, 1]
         return p_raw
@@ -825,46 +874,47 @@ class UnifiedTwoTierEngine:
     def predict_gatekeeper(self, test_df):
         return self.predict_entry(test_df)
 
-    def predict_runner(self, test_df):
+    def predict_survival(self, test_df):
         X_te = test_df[self.feature_cols].astype(float).fillna(0).values
-        if len(self.lgb_runner_models) > 0 and len(self.cat_runner_models) > 0:
-            p_lgb = np.mean([m.predict_proba(X_te)[:, 1] for m in self.lgb_runner_models], axis=0)
-            p_cat = np.mean([m.predict_proba(X_te)[:, 1] for m in self.cat_runner_models], axis=0)
-            p_raw = 0.5 * p_lgb + 0.5 * p_cat
-        else:
-            p_raw = np.full(len(test_df), 0.02)
-        if self.calibrator_8x is not None:
-            return self.calibrator_8x.predict_proba(p_raw.reshape(-1, 1))[:, 1]
-        return p_raw
+        n = len(test_df)
+        p_5x = self.predict_entry(test_df)
+        raw_probs = np.zeros((n, len(self.tp_grid)), dtype=float)
+        raw_probs[:, self.idx_5] = p_5x
+        
+        for j, k in enumerate(self.tp_grid):
+            if k == 5.0:
+                continue
+            models = self.level_models[k]
+            if isinstance(models[0], (float, int)):
+                raw_probs[:, j] = float(models[0])
+            else:
+                raw_probs[:, j] = np.mean([m.predict_proba(X_te)[:, 1] for m in models], axis=0)
+                
+        probs_mono = raw_probs.copy()
+        for j in range(self.idx_5 - 1, -1, -1):
+            probs_mono[:, j] = np.maximum(probs_mono[:, j], probs_mono[:, j + 1])
+        for j in range(self.idx_5 + 1, len(self.tp_grid)):
+            probs_mono[:, j] = np.minimum(probs_mono[:, j], probs_mono[:, j - 1])
+        return probs_mono
 
-    def predict_levels(self, test_df):
-        p5 = self.predict_entry(test_df)
-        p8 = self.predict_runner(test_df)
-        p8_mono = np.minimum(p8, p5)
-        return np.column_stack([p5, p8_mono])
+    def predict_hold(self, test_df):
+        X_te = test_df[self.feature_cols].astype(float).fillna(0).values
+        if self.hold_regressor is not None:
+            return np.clip(self.hold_regressor.predict(X_te), -1.0, 0.0)
+        return np.full(len(test_df), -0.95)
 
-    def compute_miss_payoffs(self, train_df):
-        mxs = train_df['max_x'].values
-        fxs = train_df['final_x'].values if 'final_x' in train_df.columns else train_df['finalx'].values
-        held = np.maximum(fxs - 1.0 - self.cost, -1.0)
-        miss_5 = mxs < 5.0
-        miss_8 = mxs < 8.0
-        held_5 = float(held[miss_5].mean()) if miss_5.any() else -0.95
-        held_8 = float(held[miss_8].mean()) if miss_8.any() else -0.95
-        self.miss_payoffs = {'held_5': held_5, 'held_8': held_8}
-        return self.miss_payoffs
-
-    def calculate_expected_values(self, test_df=None, p_levels=None, miss_payoffs=None):
-        if p_levels is None and test_df is not None:
-            p_levels = self.predict_levels(test_df)
-        p5 = p_levels[:, 0]
-        p8 = p_levels[:, 1]
-        mp = miss_payoffs or self.miss_payoffs
-        h5 = mp.get('held_5', -0.95) if isinstance(mp, dict) else mp[0]
-        h8 = mp.get('held_8', -0.95) if isinstance(mp, dict) else mp[1]
-        ev_5 = p5 * 3.70 + (1.0 - p5) * h5
-        ev_8 = p8 * 6.70 + (1.0 - p8) * h8
-        return np.column_stack([ev_5, ev_8])
+    def calculate_expected_values(self, test_df=None, probs=None, hat_hold=None):
+        if probs is None and test_df is not None:
+            probs = self.predict_survival(test_df)
+        if hat_hold is None and test_df is not None:
+            hat_hold = self.predict_hold(test_df)
+            
+        n = len(probs)
+        ev_matrix = np.zeros((n, len(self.tp_grid)), dtype=float)
+        for j, k in enumerate(self.tp_grid):
+            win_pnl = k - 1.0 - self.cost
+            ev_matrix[:, j] = probs[:, j] * win_pnl + (1.0 - probs[:, j]) * hat_hold
+        return ev_matrix
 
     def calibrate_scalar_threshold(self, train_df=None, target_daily_trades=2.5):
         if getattr(self, 'p_cal_oof', None) is not None and self.trn_cal_len > 0:
@@ -880,25 +930,40 @@ class UnifiedTwoTierEngine:
             q = min(max(target_daily_trades / avg_tokens_per_day, 0.001), 0.05)
             self.tau_scalar = float(np.quantile(p_cal, 1.0 - q))
         else:
-            self.tau_scalar = 0.20
+            self.tau_scalar = 0.05
         return self.tau_scalar
 
-    def decide_per_token(self, p_entry, ev_matrix, tau_scalar=None, safety_margin=0.35, mode='2tier'):
+    def decide_per_token(self, test_df, ev_matrix=None, p_entry=None, tau_scalar=None, safety_margin=0.15, mode='continuous'):
+        if p_entry is None:
+            p_entry = self.predict_entry(test_df)
+        if ev_matrix is None:
+            ev_matrix = self.calculate_expected_values(test_df)
         tau = self.tau_scalar if tau_scalar is None else tau_scalar
-        n = len(p_entry)
+        n = len(test_df)
         final_tp = np.zeros(n, dtype=float)
-        ev_5 = ev_matrix[:, 0]
-        ev_8 = ev_matrix[:, 1]
-        is_buy = (p_entry >= tau)
-        if mode == 'fixed5':
-            final_tp[is_buy] = 5.0
-        else:
-            is_upgrade = is_buy & (ev_8 > (ev_5 + safety_margin))
-            final_tp[is_buy] = 5.0
-            final_tp[is_upgrade] = 8.0
+        hat_hold = self.predict_hold(test_df)
+        dev_sell = test_df['dev_sell_ratio'].values if 'dev_sell_ratio' in test_df.columns else np.zeros(n)
+        
+        is_candidate = (p_entry >= tau)
+        is_vetoed = (hat_hold < -0.92) & (dev_sell > 0.5)
+        ev_5 = ev_matrix[:, self.idx_5]
+        
+        for i in range(n):
+            if is_candidate[i] and not is_vetoed[i]:
+                if mode == 'fixed5':
+                    final_tp[i] = 5.0
+                else:
+                    chosen_k = 5.0
+                    cand_evs = ev_matrix[i].copy()
+                    cand_evs[self.idx_5] = -999.0
+                    best_other_idx = int(np.argmax(cand_evs))
+                    if cand_evs[best_other_idx] >= ev_5[i] + safety_margin:
+                        chosen_k = self.tp_grid[best_other_idx]
+                    final_tp[i] = chosen_k
         return final_tp, ev_5
 
-TwoStageDecisionEngine = UnifiedTwoTierEngine
+TwoStageDecisionEngine = UnifiedSurvivalEngine
+UnifiedTwoTierEngine = UnifiedSurvivalEngine
 """))
 
 # Cell 7: Full 16-Day Walk-Forward Benchmark (Offline Evaluation)
@@ -907,8 +972,8 @@ cells.append(nbf.v4.new_markdown_cell("""## 5. Strict 16-Day Walk-Forward Compar
 - Invariant enforced: `target_mt <= mt_train_max - 3600`.
 - Compares:
   (a) Flat TP=5 Single-Stage Baseline (+5.47 SOL reference)
-  (b) Unified LightGBM+CatBoost Entry (Fixed TP=5)
-  (c) Unified LightGBM+CatBoost Entry with Constrained {5.0, 8.0} Exit Upgrade
+  (b) 6-Model Seed Ensemble (Fixed TP=5)
+  (c) 6-Model Seed Ensemble with Continuous Monotonic TP Grid + Rug-Risk Veto
 """))
 
 cells.append(nbf.v4.new_code_cell("""days = sorted(TR['day'].unique())
@@ -917,7 +982,7 @@ print(f"Running 16-day embargoed walk-forward evaluation across: {eval_days[0]} 
 
 baseline_records = []
 f5_records = []
-t2_records = []
+cg_records = []
 
 for i, day in enumerate(eval_days, 1):
     val = TR[TR['day'] == day].reset_index(drop=True)
@@ -958,37 +1023,36 @@ for i, day in enumerate(eval_days, 1):
     hits_base = int(((mxs_val >= 5.0) & (tp_base > 0)).sum())
     baseline_records.append({'day': day, 'taken': taken_base, 'hits': hits_base, 'pnl': pnl_base})
     
-    # 2. Unified LGBM + CatBoost Entry & 2-Tier Engine
-    wf_engine = UnifiedTwoTierEngine(feature_cols=FE, seeds=[42])
+    # 2. 6-Model Seed Ensemble & Continuous Survival Engine
+    wf_engine = UnifiedSurvivalEngine(feature_cols=FE, seeds=[42, 101, 777])
     wf_engine.fit_entry(trn)
     
-    p_entry = wf_engine.predict_entry(val)
     ev_matrix = wf_engine.calculate_expected_values(test_df=val)
     tau_scalar = wf_engine.calibrate_scalar_threshold(trn, target_daily_trades=2.5)
     
     # Architecture B: Fixed TP=5
-    tp_f5, _ = wf_engine.decide_per_token(p_entry, ev_matrix, tau_scalar=tau_scalar, mode='fixed5')
+    tp_f5, _ = wf_engine.decide_per_token(val, ev_matrix=ev_matrix, tau_scalar=tau_scalar, mode='fixed5')
     pnl_f5 = evaluate_pnl(mxs_val, fxs_val, tp_f5)
     f5_records.append({'day': day, 'taken': int((tp_f5 > 0).sum()), 'hits': int(((mxs_val >= 5.0) & (tp_f5 > 0)).sum()), 'pnl': pnl_f5})
     
-    # Architecture C: Constrained {5.0, 8.0} Exit Upgrade
-    tp_t2, _ = wf_engine.decide_per_token(p_entry, ev_matrix, tau_scalar=tau_scalar, safety_margin=0.35, mode='2tier')
-    pnl_t2 = evaluate_pnl(mxs_val, fxs_val, tp_t2)
-    t2_records.append({'day': day, 'taken': int((tp_t2 > 0).sum()), 'hits': int(((mxs_val >= tp_t2) & (tp_t2 > 0)).sum()), 'pnl': pnl_t2})
+    # Architecture C: Continuous Monotonic Grid + Rug-Risk Veto
+    tp_cg, _ = wf_engine.decide_per_token(val, ev_matrix=ev_matrix, tau_scalar=tau_scalar, safety_margin=0.15, mode='continuous')
+    pnl_cg = evaluate_pnl(mxs_val, fxs_val, tp_cg)
+    cg_records.append({'day': day, 'taken': int((tp_cg > 0).sum()), 'hits': int(((mxs_val >= tp_cg) & (tp_cg > 0)).sum()), 'pnl': pnl_cg})
     
     print(f"[{i:02d}/16] Day {day} | (a) Baseline: trades={taken_base:>2}, PnL={pnl_base:+6.2f} SOL | "
           f"(b) Fixed-5: trades={int((tp_f5 > 0).sum()):>2}, PnL={pnl_f5:+6.2f} SOL | "
-          f"(c) 2-Tier: trades={int((tp_t2 > 0).sum()):>2}, PnL={pnl_t2:+6.2f} SOL")
+          f"(c) Cont-Grid: trades={int((tp_cg > 0).sum()):>2}, PnL={pnl_cg:+6.2f} SOL")
 
 b_df = pd.DataFrame(baseline_records)
 f5_df = pd.DataFrame(f5_records)
-t2_df = pd.DataFrame(t2_records)
+cg_df = pd.DataFrame(cg_records)
 
-print("\\n" + "=" * 105)
+print("\\n" + "=" * 110)
 print("16-DAY EMBARGOED WALK-FORWARD HEAD-TO-HEAD COMPARISON")
-print("=" * 105)
-print(f"{'Strategy Architecture':<42} | {'Trades':<6} | {'Hits':<5} | {'Precision':<10} | {'Total PnL':<12} | {'Sharpe':<7} | {'Win Days'}")
-print("-" * 105)
+print("=" * 110)
+print(f"{'Strategy Architecture':<46} | {'Trades':<6} | {'Hits':<5} | {'Precision':<10} | {'Total PnL':<12} | {'Sharpe':<7} | {'Win Days'}")
+print("-" * 110)
 
 def print_row(name, d):
     tot = d['taken'].sum()
@@ -997,29 +1061,28 @@ def print_row(name, d):
     prec = (hits / max(tot, 1)) * 100.0
     sharpe = d['pnl'].mean() - 0.25 * d['pnl'].std(ddof=0)
     win = (d['pnl'] > 0).sum()
-    print(f"{name:<42} | {tot:<6} | {hits:<5} | {prec:>8.1f}% | {pnl:>+10.2f} SOL | {sharpe:>+6.2f} | {win}/{len(d)}")
+    print(f"{name:<46} | {tot:<6} | {hits:<5} | {prec:>8.1f}% | {pnl:>+10.2f} SOL | {sharpe:>+6.2f} | {win}/{len(d)}")
 
 print_row("(a) Flat TP=5 Single-Stage Baseline", b_df)
-print_row("(b) Unified LGB+CB Entry (Fixed TP=5)", f5_df)
-print_row("(c) Unified LGB+CB Entry ({5,8} Upgrade)", t2_df)
-print("=" * 105)
+print_row("(b) 6-Model Seed Ensemble (Fixed TP=5)", f5_df)
+print_row("(c) Continuous Monotonic TP Grid + Veto", cg_df)
+print("=" * 110)
 """))
 
 # Cell 8: Full Production Fit & Submission Generation
 cells.append(nbf.v4.new_markdown_cell("""## 6. Full Production Fit & Submission Generation"""))
 
-cells.append(nbf.v4.new_code_cell("""print("Training production Unified LGBM+CatBoost Entry & 2-Tier Exit Engine on full universe...")
-prod_engine = UnifiedTwoTierEngine(feature_cols=FE)
+cells.append(nbf.v4.new_code_cell("""print("Training production Unified Survival Engine on full historical universe...")
+prod_engine = UnifiedSurvivalEngine(feature_cols=FE)
 prod_engine.fit_entry(TR)
 
-print("Generating calibrated entry probabilities and expected values for test universe...")
-test_p_entry = prod_engine.predict_entry(TE)
+print("Generating calibrated expected values and continuous TP allocations for test universe...")
 test_ev = prod_engine.calculate_expected_values(test_df=TE)
 
 tau_scalar = prod_engine.calibrate_scalar_threshold(TR, target_daily_trades=2.5)
 print(f"Calibrated causal scalar cutoff: tau = {tau_scalar:.4f}")
 
-test_tp, best_ev = prod_engine.decide_per_token(test_p_entry, test_ev, tau_scalar=tau_scalar, safety_margin=0.35, mode='2tier')
+test_tp, best_ev = prod_engine.decide_per_token(TE, ev_matrix=test_ev, tau_scalar=tau_scalar, safety_margin=0.15, mode='continuous')
 
 sub = pd.DataFrame({'mint': TE['mint'], 'tp': test_tp})
 

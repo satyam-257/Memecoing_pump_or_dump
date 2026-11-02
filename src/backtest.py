@@ -1,9 +1,9 @@
-"""Strict embargoed walk-forward backtesting protocol and 16-day comparative benchmark across 3 architectures."""
+"""Strict embargoed walk-forward backtesting protocol and 16-day comparative benchmark across continuous survival architectures."""
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
 from src.config import WIN, EMBARGO, LEVELS, COST, SEEDS, LGB_PARAMS, HOLD_DAYS
-from src.models import UnifiedTwoTierEngine
+from src.models import UnifiedSurvivalEngine
 
 def evaluate_pnl(y_true_max, y_true_end, y_pred_tp, cost=COST):
     """
@@ -31,20 +31,20 @@ def run_16day_comparison(df, feature_cols):
     resolved >= 1 hour before the fold day starts) and prints a side-by-side comparison table
     comparing:
     (a) Flat TP=5 Baseline (Single-Stage LightGBM)
-    (b) Unified LightGBM+CatBoost Entry (target >=5x) with Fixed TP=5
-    (c) Unified LightGBM+CatBoost Entry with Constrained {5.0, 8.0} Exit Upgrade
+    (b) 6-Model Seed Ensemble with Fixed TP=5
+    (c) 6-Model Seed Ensemble with Continuous Monotonic TP Grid + Rug-Risk Veto
     """
     days = sorted(df['day'].unique())
     eval_days = days[-16:]
     
     baseline_records = []
     unified_fixed5_records = []
-    unified_2tier_records = []
+    continuous_grid_records = []
     
-    print("=" * 105)
+    print("=" * 110)
     print(f"STARTING 16-DAY EMBARGOED WALK-FORWARD BENCHMARK ({eval_days[0]} to {eval_days[-1]})")
     print(f"Safety Protocol Enforced: target_mt <= mt_train_max - 3600 (Strict 1-hour resolution embargo)")
-    print("=" * 105)
+    print("=" * 110)
     
     for i, day in enumerate(eval_days, 1):
         val = df[df['day'] == day].reset_index(drop=True)
@@ -95,17 +95,17 @@ def run_16day_comparison(df, feature_cols):
         })
         
         # -----------------------------------------------------------------
-        # (b) & (c) UNIFIED LIGHTGBM + CATBOOST ENTRY & 2-TIER EXIT ENGINE
+        # (b) & (c) 6-MODEL ENSEMBLE + TERMINAL FLOOR REGRESSOR + CONTINUOUS TP GRID
         # -----------------------------------------------------------------
-        engine = UnifiedTwoTierEngine(feature_cols=feature_cols, seeds=[42])
+        engine = UnifiedSurvivalEngine(feature_cols=feature_cols, seeds=[42, 101, 777])
         engine.fit_entry(trn)
         
-        p_entry = engine.predict_entry(val)
-        ev_matrix = engine.calculate_expected_values(test_df=val)
+        p_entry_val = engine.predict_entry(val)
+        ev_matrix_val = engine.calculate_expected_values(test_df=val)
         tau_scalar = engine.calibrate_scalar_threshold(trn, target_daily_trades=2.5)
         
-        # (b) Architecture B: Unified LGB+CatBoost Entry with Fixed TP=5
-        tp_fixed5, _ = engine.decide_per_token(p_entry, ev_matrix, tau_scalar=tau_scalar, mode='fixed5')
+        # (b) Architecture B: 6-Model Seed Ensemble with Fixed TP=5
+        tp_fixed5, _ = engine.decide_per_token(val, ev_matrix=ev_matrix_val, p_entry=p_entry_val, tau_scalar=tau_scalar, mode='fixed5')
         pnl_fixed5 = evaluate_pnl(mxs_val, fxs_val, tp_fixed5)
         taken_fixed5 = int((tp_fixed5 > 0).sum())
         hits_fixed5 = int(((mxs_val >= 5.0) & (tp_fixed5 > 0)).sum())
@@ -114,31 +114,33 @@ def run_16day_comparison(df, feature_cols):
             'day': day, 'taken': taken_fixed5, 'hits': hits_fixed5, 'pnl': pnl_fixed5
         })
         
-        # (c) Architecture C: Unified LGB+CatBoost Entry with Constrained {5.0, 8.0} Exit Upgrade
-        tp_2tier, _ = engine.decide_per_token(p_entry, ev_matrix, tau_scalar=tau_scalar, safety_margin=0.35, mode='2tier')
-        pnl_2tier = evaluate_pnl(mxs_val, fxs_val, tp_2tier)
-        taken_2tier = int((tp_2tier > 0).sum())
-        hits_2tier = int(((mxs_val >= tp_2tier) & (tp_2tier > 0)).sum())
-        upgrades_2tier = int((tp_2tier == 8.0).sum())
+        # (c) Architecture C: Continuous Monotonic TP Grid + Terminal Floor Regressor + Rug-Risk Veto
+        tp_cont, _ = engine.decide_per_token(val, ev_matrix=ev_matrix_val, p_entry=p_entry_val, tau_scalar=tau_scalar, safety_margin=0.15, mode='continuous')
+        pnl_cont = evaluate_pnl(mxs_val, fxs_val, tp_cont)
+        taken_cont = int((tp_cont > 0).sum())
+        hits_cont = int(((mxs_val >= tp_cont) & (tp_cont > 0)).sum())
         
-        unified_2tier_records.append({
-            'day': day, 'taken': taken_2tier, 'hits': hits_2tier, 'upgrades': upgrades_2tier, 'pnl': pnl_2tier
+        # Level distribution breakdown
+        grid_counts = {k: int((tp_cont == k).sum()) for k in engine.tp_grid}
+        
+        continuous_grid_records.append({
+            'day': day, 'taken': taken_cont, 'hits': hits_cont, 'pnl': pnl_cont, 'counts': grid_counts
         })
         
-        print(f"[{i:02d}/16] Day {day} | (a) Baseline: trades={taken_base:>2}, hits={hits_base:>2}, PnL={pnl_base:+6.2f} SOL | "
-              f"(b) Unified Fixed-5: trades={taken_fixed5:>2}, hits={hits_fixed5:>2}, PnL={pnl_fixed5:+6.2f} SOL | "
-              f"(c) 2-Tier Upgrade: trades={taken_2tier:>2}, hits={hits_2tier:>2} (upg={upgrades_2tier}), PnL={pnl_2tier:+6.2f} SOL")
+        print(f"[{i:02d}/16] Day {day} | (a) Baseline: trades={taken_base:>2}, PnL={pnl_base:+6.2f} SOL | "
+              f"(b) 6-Model Fixed-5: trades={taken_fixed5:>2}, PnL={pnl_fixed5:+6.2f} SOL | "
+              f"(c) Continuous Grid: trades={taken_cont:>2}, hits={hits_cont:>2}, PnL={pnl_cont:+6.2f} SOL")
               
     b_df = pd.DataFrame(baseline_records)
     f5_df = pd.DataFrame(unified_fixed5_records)
-    t2_df = pd.DataFrame(unified_2tier_records)
+    cg_df = pd.DataFrame(continuous_grid_records)
     
     # Telemetry and summary comparison
-    print("\n" + "=" * 105)
+    print("\n" + "=" * 110)
     print("16-DAY EMBARGOED WALK-FORWARD HEAD-TO-HEAD BENCHMARK RESULTS")
-    print("=" * 105)
-    print(f"{'Strategy Architecture':<42} | {'Trades':<6} | {'Hits':<5} | {'Precision':<10} | {'Total PnL':<12} | {'Sharpe':<7} | {'Win Days'}")
-    print("-" * 105)
+    print("=" * 110)
+    print(f"{'Strategy Architecture':<46} | {'Trades':<6} | {'Hits':<5} | {'Precision':<10} | {'Total PnL':<12} | {'Sharpe':<7} | {'Win Days'}")
+    print("-" * 110)
     
     def print_metrics(name, d):
         tot_trades = d['taken'].sum()
@@ -149,19 +151,19 @@ def run_16day_comparison(df, feature_cols):
         std_pnl = d['pnl'].std(ddof=0)
         sharpe = mean_pnl - 0.25 * std_pnl
         win_days = (d['pnl'] > 0).sum()
-        print(f"{name:<42} | {tot_trades:<6} | {tot_hits:<5} | {prec:>8.1f}% | {tot_pnl:>+10.2f} SOL | {sharpe:>+6.2f} | {win_days}/{len(d)} ({win_days/len(d)*100:.0f}%)")
+        print(f"{name:<46} | {tot_trades:<6} | {tot_hits:<5} | {prec:>8.1f}% | {tot_pnl:>+10.2f} SOL | {sharpe:>+6.2f} | {win_days}/{len(d)} ({win_days/len(d)*100:.0f}%)")
         return tot_pnl, sharpe
         
     pnl_a, sh_a = print_metrics("(a) Flat TP=5 Single-Stage Baseline", b_df)
-    pnl_b, sh_b = print_metrics("(b) Unified LGB+CB Entry (Fixed TP=5)", f5_df)
-    pnl_c, sh_c = print_metrics("(c) Unified LGB+CB Entry ({5,8} Exit Upgrade)", t2_df)
-    print("=" * 105)
+    pnl_b, sh_b = print_metrics("(b) 6-Model Ensemble (Fixed TP=5)", f5_df)
+    pnl_c, sh_c = print_metrics("(c) Continuous Monotonic TP Grid + Veto", cg_df)
+    print("=" * 110)
     
     diff_b = pnl_b - pnl_a
     diff_c = pnl_c - pnl_a
     print(f"Alpha Gain (b vs Baseline): {diff_b:+.2f} SOL")
     print(f"Alpha Gain (c vs Baseline): {diff_c:+.2f} SOL")
     
-    best_arch = "(c) Unified LGB+CB Entry ({5,8} Exit Upgrade)" if pnl_c >= pnl_b else "(b) Unified LGB+CB Entry (Fixed TP=5)"
+    best_arch = "(c) Continuous Monotonic TP Grid + Veto" if (pnl_c >= pnl_b and sh_c >= sh_b) else "(b) 6-Model Ensemble (Fixed TP=5)"
     print(f"\nWinning Strategy to Deploy: {best_arch}")
-    return b_df, f5_df, t2_df
+    return b_df, f5_df, cg_df

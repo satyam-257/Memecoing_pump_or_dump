@@ -44,11 +44,14 @@ def main():
     amm_edges_df = None
     
     if os.path.exists(c_sample) and os.path.exists(a_sample):
-        c_cols = [c for c in CURVE_COLS if c not in ('slot', 'tx_idx')] + ['mint', 'failed', 'new_price', 'sol', 'ts_rel']
-        a_cols = [c for c in AMM_COLS if c not in ('slot', 'tx_idx')] + ['mint', 'direction', 'base_token', 'new_price', 'sol', 'ts_rel', 'signing_wallet', 'fee_payer']
+        c_avail = pd.read_csv(c_sample, nrows=1).columns
+        a_avail = pd.read_csv(a_sample, nrows=1).columns
         
-        c_df = pd.read_csv(c_sample, usecols=[c for c in c_cols if c in pd.read_csv(c_sample, nrows=1).columns])
-        a_df = pd.read_csv(a_sample, usecols=[c for c in a_cols if c in pd.read_csv(a_sample, nrows=1).columns])
+        c_cols = [c for c in CURVE_COLS if c in c_avail] + [c for c in ['slot', 'tx_idx', 'signature'] if c in c_avail and c not in CURVE_COLS]
+        a_cols = [c for c in AMM_COLS if c in a_avail] + [c for c in ['slot', 'tx_idx', 'signature'] if c in a_avail and c not in AMM_COLS]
+        
+        c_df = pd.read_csv(c_sample, usecols=list(set(c_cols)))
+        a_df = pd.read_csv(a_sample, usecols=list(set(a_cols)))
         
         tape_features_df = extract_tape_features(c_df, a_df)
         a_buys = a_df[a_df.ts_rel <= 60].copy()
