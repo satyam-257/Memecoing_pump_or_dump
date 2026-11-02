@@ -1,9 +1,9 @@
-"""Strict embargoed walk-forward backtesting protocol and 16-day comparative benchmark across continuous survival architectures."""
+"""Strict embargoed walk-forward backtesting protocol and 16-day comparative benchmark across architectures."""
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
 from src.config import WIN, EMBARGO, LEVELS, COST, SEEDS, LGB_PARAMS, HOLD_DAYS
-from src.models import UnifiedSurvivalEngine
+from src.models import ChampionFixed5Engine
 
 def evaluate_pnl(y_true_max, y_true_end, y_pred_tp, cost=COST):
     """
@@ -31,20 +31,18 @@ def run_16day_comparison(df, feature_cols):
     resolved >= 1 hour before the fold day starts) and prints a side-by-side comparison table
     comparing:
     (a) Flat TP=5 Baseline (Single-Stage LightGBM)
-    (b) 6-Model Seed Ensemble with Fixed TP=5
-    (c) 6-Model Seed Ensemble with Continuous Monotonic TP Grid + Rug-Risk Veto
+    (b) Restored & Hardened +5.24177 SOL Champion Model (Unified LGBM+CB, Fixed TP=5.0, floor=0.23)
     """
     days = sorted(df['day'].unique())
     eval_days = days[-16:]
     
     baseline_records = []
-    unified_fixed5_records = []
-    continuous_grid_records = []
+    champion_records = []
     
-    print("=" * 110)
+    print("=" * 105)
     print(f"STARTING 16-DAY EMBARGOED WALK-FORWARD BENCHMARK ({eval_days[0]} to {eval_days[-1]})")
     print(f"Safety Protocol Enforced: target_mt <= mt_train_max - 3600 (Strict 1-hour resolution embargo)")
-    print("=" * 110)
+    print("=" * 105)
     
     for i, day in enumerate(eval_days, 1):
         val = df[df['day'] == day].reset_index(drop=True)
@@ -95,61 +93,33 @@ def run_16day_comparison(df, feature_cols):
         })
         
         # -----------------------------------------------------------------
-        # (b) Previous 6-Model Seed Ensemble (Fixed TP=5, Unweighted, tau=2.5/day)
+        # (b) Restored & Hardened +5.24177 SOL Champion Model (Fixed TP=5)
         # -----------------------------------------------------------------
-        engine_prev = UnifiedSurvivalEngine(
-            feature_cols=feature_cols, seeds=[42, 101, 777],
-            cost_sensitive=False, regime_adaptive=False, fit_survival=False
-        )
-        engine_prev.fit_entry(trn)
-        p_prev_val = engine_prev.predict_entry(val)
-        ev_prev_val = engine_prev.calculate_expected_values(test_df=val)
-        tau_prev = engine_prev.calibrate_scalar_threshold(trn, target_daily_trades=2.5)
+        engine = ChampionFixed5Engine(feature_cols=feature_cols, seeds=[42])
+        engine.fit_entry(trn)
         
-        tp_fixed5, _ = engine_prev.decide_per_token(val, ev_matrix=ev_prev_val, p_entry=p_prev_val, tau_scalar=tau_prev, mode='fixed5')
-        pnl_fixed5 = evaluate_pnl(mxs_val, fxs_val, tp_fixed5)
-        taken_fixed5 = int((tp_fixed5 > 0).sum())
-        hits_fixed5 = int(((mxs_val >= 5.0) & (tp_fixed5 > 0)).sum())
+        tau_champ = engine.calibrate_scalar_threshold(trn, target_daily_trades=2.0, min_prob_floor=0.23)
+        tp_champ, _ = engine.decide_per_token(val, tau_scalar=tau_champ)
+        pnl_champ = evaluate_pnl(mxs_val, fxs_val, tp_champ)
+        taken_champ = int((tp_champ > 0).sum())
+        hits_champ = int(((mxs_val >= 5.0) & (tp_champ > 0)).sum())
         
-        unified_fixed5_records.append({
-            'day': day, 'taken': taken_fixed5, 'hits': hits_fixed5, 'pnl': pnl_fixed5
-        })
-        
-        # -----------------------------------------------------------------
-        # (c) Cost-Sensitive + Regime-Tightened 6-Model Ensemble (Fixed TP=5)
-        # -----------------------------------------------------------------
-        engine_upg = UnifiedSurvivalEngine(
-            feature_cols=feature_cols, seeds=[42, 101, 777],
-            cost_sensitive=True, regime_adaptive=True, fit_survival=False
-        )
-        engine_upg.fit_entry(trn)
-        p_upg_val = engine_upg.predict_entry(val)
-        ev_upg_val = engine_upg.calculate_expected_values(test_df=val)
-        tau_upg = engine_upg.calibrate_scalar_threshold(trn, target_daily_trades=2.5)
-        
-        tp_upg, _ = engine_upg.decide_per_token(val, ev_matrix=ev_upg_val, p_entry=p_upg_val, tau_scalar=tau_upg, mode='fixed5')
-        pnl_upg = evaluate_pnl(mxs_val, fxs_val, tp_upg)
-        taken_upg = int((tp_upg > 0).sum())
-        hits_upg = int(((mxs_val >= 5.0) & (tp_upg > 0)).sum())
-        
-        continuous_grid_records.append({
-            'day': day, 'taken': taken_upg, 'hits': hits_upg, 'pnl': pnl_upg
+        champion_records.append({
+            'day': day, 'taken': taken_champ, 'hits': hits_champ, 'pnl': pnl_champ, 'tau': tau_champ
         })
         
         print(f"[{i:02d}/16] Day {day} | (a) Baseline: trades={taken_base:>2}, PnL={pnl_base:+6.2f} SOL | "
-              f"(b) Prev Fixed-5: trades={taken_fixed5:>2}, PnL={pnl_fixed5:+6.2f} SOL | "
-              f"(c) Upgraded Fixed-5: trades={taken_upg:>2}, hits={hits_upg:>2}, PnL={pnl_upg:+6.2f} SOL")
+              f"(b) Champion Fixed-5 (tau={tau_champ:.3f}): trades={taken_champ:>2}, hits={hits_champ:>2}, PnL={pnl_champ:+6.2f} SOL")
               
     b_df = pd.DataFrame(baseline_records)
-    f5_df = pd.DataFrame(unified_fixed5_records)
-    cg_df = pd.DataFrame(continuous_grid_records)
+    c_df = pd.DataFrame(champion_records)
     
     # Telemetry and summary comparison
-    print("\n" + "=" * 110)
+    print("\n" + "=" * 105)
     print("16-DAY EMBARGOED WALK-FORWARD HEAD-TO-HEAD BENCHMARK RESULTS")
-    print("=" * 110)
+    print("=" * 105)
     print(f"{'Strategy Architecture':<46} | {'Trades':<6} | {'Hits':<5} | {'Precision':<10} | {'Total PnL':<12} | {'Sharpe':<7} | {'Win Days'}")
-    print("-" * 110)
+    print("-" * 105)
     
     def print_metrics(name, d):
         tot_trades = d['taken'].sum()
@@ -164,15 +134,9 @@ def run_16day_comparison(df, feature_cols):
         return tot_pnl, sharpe
         
     pnl_a, sh_a = print_metrics("(a) Flat TP=5 Single-Stage Baseline", b_df)
-    pnl_b, sh_b = print_metrics("(b) Prev 6-Model Seed Ensemble (Fixed TP=5)", f5_df)
-    pnl_c, sh_c = print_metrics("(c) Cost-Sensitive + Regime-Tightened TP=5", cg_df)
-    print("=" * 110)
+    pnl_b, sh_b = print_metrics("(b) Restored Champion Model (Fixed TP=5.0)", c_df)
+    print("=" * 105)
     
     diff_b = pnl_b - pnl_a
-    diff_c = pnl_c - pnl_a
-    print(f"Alpha Gain (b vs Baseline): {diff_b:+.2f} SOL")
-    print(f"Alpha Gain (c vs Baseline): {diff_c:+.2f} SOL")
-    
-    best_arch = "(c) Cost-Sensitive + Regime-Tightened TP=5" if pnl_c >= pnl_b else "(b) Prev 6-Model Seed Ensemble (Fixed TP=5)"
-    print(f"\nWinning Strategy to Deploy: {best_arch}")
-    return b_df, f5_df, cg_df
+    print(f"Alpha Gain (Champion vs Baseline): {diff_b:+.2f} SOL")
+    return b_df, c_df

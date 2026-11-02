@@ -90,21 +90,20 @@ def main():
     feature_cols = [c for c in TR.columns if c not in exclude_cols and np.issubdtype(TR[c].dtype, np.number)]
     print(f"Total features assembled: {len(feature_cols)}")
     
-    # 4. 6-Model Seed Ensemble, Terminal Floor Regressor, & Continuous TP Grid
-    print("\n[4/5] Training 6-Model Seed Ensemble (3x LGBM + 3x CatBoost on P(>=5x)), Terminal Floor Regressor, & Survival Grid...")
+    # 4. Restored Champion Full-Feature Entry Gatekeeper & Fixed TP=5.0
+    print("\n[4/5] Training Champion Entry Classifier (LGBM + CatBoost on P(>=5x), zero sample_weight distortion)...")
     engine = TwoStageDecisionEngine(feature_cols=feature_cols)
     
     engine.fit_entry(TR)
     
     # 5. Predict on test set
-    print("\n[5/5] Generating calibrated test expected values and continuous TP allocation...")
+    print("\n[5/5] Generating unbiased test predictions and Fixed TP=5.0 allocation...")
     test_p = engine.predict_entry(TE)
-    test_ev = engine.calculate_expected_values(test_df=TE)
     
     # Causal per-token execution rule (zero test ranking or peeking)
-    tau_scalar = engine.calibrate_scalar_threshold(TR, target_daily_trades=2.5)
-    print(f"Calibrated causal Stage 1 scalar cutoff on last 5 training days: tau = {tau_scalar:.4f}")
-    test_tp, best_ev = engine.decide_per_token(TE, ev_matrix=test_ev, p_entry=test_p, tau_scalar=tau_scalar, mode='fixed5')
+    tau_scalar = engine.calibrate_scalar_threshold(TR, target_daily_trades=2.0, min_prob_floor=0.23)
+    print(f"Calibrated causal Stage 1 scalar cutoff on last 5 training days: tau = {tau_scalar:.4f} (floor >= 0.23)")
+    test_tp, best_ev = engine.decide_per_token(TE, p_entry=test_p, tau_scalar=tau_scalar)
     
     # Build verified submission dataframe
     sub = pd.DataFrame({
