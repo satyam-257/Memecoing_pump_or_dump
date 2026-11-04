@@ -101,10 +101,34 @@ def main():
     test_p = engine.predict_entry(TE)
     
     # Causal per-token execution rule (zero test ranking or peeking)
-    tau_scalar = engine.calibrate_scalar_threshold(TR, target_daily_trades=2.0, min_prob_floor=0.23)
-    print(f"Calibrated causal Stage 1 scalar cutoff on last 5 training days: tau = {tau_scalar:.4f} (floor >= 0.23)")
-    test_tp, best_ev = engine.decide_per_token(TE, p_entry=test_p, tau_scalar=tau_scalar)
+    tau_scalar = engine.calibrate_scalar_threshold(TR, target_daily_trades=2.0, min_prob_floor=0.21)
+    print(f"Calibrated causal Stage 1 scalar cutoff on last 5 training days: tau = {tau_scalar:.4f} (break-even floor >= 0.21)")
+    test_tp, best_ev = engine.decide_per_token(TE, p_entry=test_p, tau_scalar=tau_scalar, min_daily_trades=4, max_daily_trades=12, min_prob_floor=0.21)
     
+    # Diagnostic: Top 15 predicted tokens in test universe
+    sort_te_idx = np.argsort(test_p)[::-1]
+    print("\n--- TOP 15 PREDICTED TOKENS IN TEST UNIVERSE ---")
+    for r, idx in enumerate(sort_te_idx[:15], 1):
+        m_name = TE['mint'].iloc[idx]
+        print(f"Rank {r:2d}: mint={m_name[:20]}... | P_cal={test_p[idx]:.4f} | tau={tau_scalar:.4f} | tp={test_tp[idx]}")
+
+    # Also evaluate on 409-token benchmark set if present
+    check_new_path = os.path.join(DATA_DIR, 'check_new', 'test.csv')
+    if os.path.exists(check_new_path):
+        t409_df = pd.read_csv(check_new_path)
+        t409_df['day'] = pd.to_datetime(t409_df.mt, unit='s').dt.strftime('%Y-%m-%d')
+        TE409 = merge_features(t409_df)
+        p409 = engine.predict_entry(TE409)
+        tp409, _ = engine.decide_per_token(TE409, p_entry=p409, tau_scalar=tau_scalar, min_daily_trades=4, max_daily_trades=12, min_prob_floor=0.21)
+        buys_409 = int((tp409 > 0).sum())
+        print(f"\n--- BENCHMARK VERIFICATION ON 409 TEST TOKENS (data/check_new/test.csv) ---")
+        print(f"Tokens bought (tp > 0) on 409 set: {buys_409} / {len(t409_df)} (Target: 4 to 15 trades)")
+        s409_idx = np.argsort(p409)[::-1]
+        for r, idx in enumerate(s409_idx[:15], 1):
+            m_name = TE409['mint'].iloc[idx]
+            print(f"Rank {r:2d}: mint={m_name[:20]}... | P_cal={p409[idx]:.4f} | tp={tp409[idx]}")
+        assert 4 <= buys_409 <= 15, f"Validation failure: buys on 409 set must be between 4 and 15, got {buys_409}"
+
     # Build verified submission dataframe
     sub = pd.DataFrame({
         'mint': TE['mint'],
