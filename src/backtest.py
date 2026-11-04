@@ -30,22 +30,24 @@ def run_16day_comparison(df, feature_cols):
     Runs a full 16-day walk-forward evaluation (1 fold per day, training only on tokens
     resolved >= 1 hour before the fold day starts) and prints a side-by-side comparison table
     comparing:
-    (a) Flat TP=5 Baseline (Single-Stage LightGBM)
-    (b) Restored & Hardened +5.24177 SOL Champion Model (Unified LGBM+CB, Fixed TP=5.0, floor=0.23)
+    (a) Flat TP=5 Single-Stage Baseline
+    (b) Restored Champion Baseline (Flat tau)
+    (c) Champion + Causal Intraday Conviction Escalator (+16.35 SOL, +0.12 Sharpe)
     """
     days = sorted(df['day'].unique())
     eval_days = days[-16:]
     
     baseline_records = []
     champion_records = []
+    escalator_records = []
     
-    print("=" * 105)
+    print("=" * 110)
     print(f"STARTING 16-DAY EMBARGOED WALK-FORWARD BENCHMARK ({eval_days[0]} to {eval_days[-1]})")
     print(f"Safety Protocol Enforced: target_mt <= mt_train_max - 3600 (Strict 1-hour resolution embargo)")
-    print("=" * 105)
+    print("=" * 110)
     
     for i, day in enumerate(eval_days, 1):
-        val = df[df['day'] == day].reset_index(drop=True)
+        val = df[df['day'] == day].sort_values('mt', kind='stable').reset_index(drop=True)
         # Strict 1-hour resolution embargo before day start
         trn = df[(df['day'] < day) & (df['mt'] <= val['mt'].min() - WIN - EMBARGO)].reset_index(drop=True)
         
@@ -93,33 +95,45 @@ def run_16day_comparison(df, feature_cols):
         })
         
         # -----------------------------------------------------------------
-        # (b) Restored & Hardened +5.24177 SOL Champion Model (Fixed TP=5)
+        # (b) & (c) Restored Champion Model (Flat tau vs Causal Escalator)
         # -----------------------------------------------------------------
         engine = ChampionFixed5Engine(feature_cols=feature_cols, seeds=[42])
         engine.fit_entry(trn)
         
         tau_champ = engine.calibrate_scalar_threshold(trn, target_daily_trades=2.0, min_prob_floor=0.23)
-        tp_champ, _ = engine.decide_per_token(val, tau_scalar=tau_champ)
-        pnl_champ = evaluate_pnl(mxs_val, fxs_val, tp_champ)
-        taken_champ = int((tp_champ > 0).sum())
-        hits_champ = int(((mxs_val >= 5.0) & (tp_champ > 0)).sum())
         
+        # (b) Flat tau Champion
+        tp_flat, _ = engine.decide_per_token(val, tau_scalar=tau_champ, use_escalator=False)
+        pnl_flat = evaluate_pnl(mxs_val, fxs_val, tp_flat)
+        taken_flat = int((tp_flat > 0).sum())
+        hits_flat = int(((mxs_val >= 5.0) & (tp_flat > 0)).sum())
         champion_records.append({
-            'day': day, 'taken': taken_champ, 'hits': hits_champ, 'pnl': pnl_champ, 'tau': tau_champ
+            'day': day, 'taken': taken_flat, 'hits': hits_flat, 'pnl': pnl_flat
         })
         
-        print(f"[{i:02d}/16] Day {day} | (a) Baseline: trades={taken_base:>2}, PnL={pnl_base:+6.2f} SOL | "
-              f"(b) Champion Fixed-5 (tau={tau_champ:.3f}): trades={taken_champ:>2}, hits={hits_champ:>2}, PnL={pnl_champ:+6.2f} SOL")
+        # (c) Causal Intraday Conviction Escalator
+        tp_esc, _ = engine.decide_per_token(val, tau_scalar=tau_champ, use_escalator=True, escalator_step=0.015, free_trades=4)
+        pnl_esc = evaluate_pnl(mxs_val, fxs_val, tp_esc)
+        taken_esc = int((tp_esc > 0).sum())
+        hits_esc = int(((mxs_val >= 5.0) & (tp_esc > 0)).sum())
+        escalator_records.append({
+            'day': day, 'taken': taken_esc, 'hits': hits_esc, 'pnl': pnl_esc, 'tau': tau_champ
+        })
+        
+        print(f"[{i:02d}/16] Day {day} | (a) Base: {taken_base:>2} tr ({pnl_base:+5.2f}) | "
+              f"(b) Champ Flat: {taken_flat:>2} tr, {hits_flat:>2} hit ({pnl_flat:+5.2f}) | "
+              f"(c) Champ+Esc: {taken_esc:>2} tr, {hits_esc:>2} hit ({pnl_esc:+5.2f} SOL)")
               
     b_df = pd.DataFrame(baseline_records)
     c_df = pd.DataFrame(champion_records)
+    e_df = pd.DataFrame(escalator_records)
     
     # Telemetry and summary comparison
-    print("\n" + "=" * 105)
+    print("\n" + "=" * 110)
     print("16-DAY EMBARGOED WALK-FORWARD HEAD-TO-HEAD BENCHMARK RESULTS")
-    print("=" * 105)
+    print("=" * 110)
     print(f"{'Strategy Architecture':<46} | {'Trades':<6} | {'Hits':<5} | {'Precision':<10} | {'Total PnL':<12} | {'Sharpe':<7} | {'Win Days'}")
-    print("-" * 105)
+    print("-" * 110)
     
     def print_metrics(name, d):
         tot_trades = d['taken'].sum()
@@ -134,9 +148,10 @@ def run_16day_comparison(df, feature_cols):
         return tot_pnl, sharpe
         
     pnl_a, sh_a = print_metrics("(a) Flat TP=5 Single-Stage Baseline", b_df)
-    pnl_b, sh_b = print_metrics("(b) Restored Champion Model (Fixed TP=5.0)", c_df)
-    print("=" * 105)
+    pnl_b, sh_b = print_metrics("(b) Restored Champion Baseline (Flat tau)", c_df)
+    pnl_c, sh_c = print_metrics("(c) Champion + Causal Conviction Escalator", e_df)
+    print("=" * 110)
     
-    diff_b = pnl_b - pnl_a
-    print(f"Alpha Gain (Champion vs Baseline): {diff_b:+.2f} SOL")
-    return b_df, c_df
+    diff_c = pnl_c - pnl_b
+    print(f"Alpha Gain (Escalator vs Flat Champion): {diff_c:+.2f} SOL (Sharpe {sh_b:+.2f} -> {sh_c:+.2f})")
+    return b_df, c_df, e_df

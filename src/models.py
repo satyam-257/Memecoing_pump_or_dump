@@ -162,27 +162,46 @@ class ChampionFixed5Engine:
             self.tau_scalar = min_prob_floor
         return self.tau_scalar
 
-    def decide_per_token(self, test_df_or_p, ev_matrix=None, p_entry=None, tau_scalar=None, **kwargs):
+    def decide_per_token(self, test_df_or_p, ev_matrix=None, p_entry=None, tau_scalar=None, use_escalator=True, escalator_step=0.015, free_trades=4, **kwargs):
         """
-        Causal per-token execution rule (zero test ranking or peeking):
-        For each token i:
-          If p_entry[i] >= tau_scalar:
-              tp[i] = 5.0
-          Else:
-              tp[i] = 0.0 (Costless Skip)
+        Causal per-token execution rule with causal intraday conviction escalator:
+        - Evaluates test tokens strictly in chronological order of mt (zero future peeking).
+        - Tracks the rolling count of entries taken in the trailing 24 hours: n_recent_24h.
+        - For every trade taken in trailing 24h beyond free_trades (4), dynamically escalates required hurdle:
+            tau_effective = tau* + escalator_step * max(0, n_recent_24h - free_trades)
+        - If p[i] >= tau_effective: enters trade at tp = 5.0 and commits mt_i to trailing window.
+        - Else: skips trade at zero cost (tp = 0.0).
         """
         if isinstance(test_df_or_p, (pd.DataFrame, dict)):
-            p = self.predict_entry(test_df_or_p) if p_entry is None else np.asarray(p_entry)
+            df = test_df_or_p
+            p = self.predict_entry(df) if p_entry is None else np.asarray(p_entry)
+            mts = df['mt'].values if 'mt' in df else np.arange(len(p), dtype=float) * 100.0
         else:
             p = np.asarray(test_df_or_p)
+            mts = np.arange(len(p), dtype=float) * 100.0
             
         tau = self.tau_scalar if tau_scalar is None else tau_scalar
         n = len(p)
         final_tp = np.zeros(n, dtype=float)
         
-        is_buy = (p >= tau)
-        final_tp[is_buy] = 5.0
-        
+        if not use_escalator:
+            is_buy = (p >= tau)
+            final_tp[is_buy] = 5.0
+        else:
+            # Sort indices causally by migration timestamp (stable order)
+            sort_idx = np.argsort(mts, kind='stable')
+            past_taken_mts = []
+            
+            for idx in sort_idx:
+                cur_mt = float(mts[idx])
+                # Trailing 24h window count strictly before cur_mt
+                recent_24h_count = sum(1 for t in past_taken_mts if cur_mt - 86400.0 <= t < cur_mt)
+                tau_eff = tau + escalator_step * max(0, recent_24h_count - free_trades)
+                
+                if p[idx] >= tau_eff:
+                    final_tp[idx] = 5.0
+                    past_taken_mts.append(cur_mt)
+                    
         ev_5 = p * 3.70 + (1.0 - p) * self.miss_payoff
         return final_tp, ev_5
 
