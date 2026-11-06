@@ -35,4 +35,5 @@ catboost_info/
 # Data and large submission outputs
 *.csv
 *.zip
+*.parquet
 

@@ -832,32 +832,28 @@ class ChampionFixed5Engine:
         ev_5 = p * 3.70 + (1.0 - p) * self.miss_payoff
         return np.column_stack([ev_5])
 
-    def calibrate_scalar_threshold(self, train_df=None, target_daily_trades=2.0, min_prob_floor=0.21):
+    def calibrate_scalar_threshold(self, train_df=None, target_daily_trades=2.0, min_prob_floor=0.220):
         if getattr(self, 'p_oof_cal', None) is not None and self.trn_cal_len > 0:
-            avg_tokens_per_day = max(self.trn_cal_len / float(self.cal_days_len), 10.0)
-            q = min(max(target_daily_trades / avg_tokens_per_day, 0.001), 0.05)
-            raw_tau = float(np.quantile(self.p_oof_cal, 1.0 - q))
-            self.tau_scalar = max(raw_tau, min_prob_floor)
+            raw_tau = float(np.quantile(self.p_oof_cal, 0.985))
+            self.tau_scalar = float(np.clip(raw_tau, 0.225, 0.270))
         elif train_df is not None:
             d_trn = sorted(train_df.day.unique())
             cal_days = d_trn[-HOLD_DAYS:]
             trn_cal = train_df[train_df.day.isin(cal_days)].reset_index(drop=True)
             p_cal = self.predict_entry(trn_cal)
-            avg_tokens_per_day = max(len(trn_cal) / float(len(cal_days)), 10.0)
-            q = min(max(target_daily_trades / avg_tokens_per_day, 0.001), 0.05)
-            raw_tau = float(np.quantile(p_cal, 1.0 - q))
-            self.tau_scalar = max(raw_tau, min_prob_floor)
+            raw_tau = float(np.quantile(p_cal, 0.985))
+            self.tau_scalar = float(np.clip(raw_tau, 0.225, 0.270))
         else:
-            self.tau_scalar = min_prob_floor
+            self.tau_scalar = 0.225
         return self.tau_scalar
 
-    def decide_per_token(self, test_df_or_p, ev_matrix=None, p_entry=None, tau_scalar=None, use_escalator=True, escalator_step=0.015, free_trades=4, min_daily_trades=4, max_daily_trades=12, min_prob_floor=0.21, **kwargs):
+    def decide_per_token(self, test_df_or_p, ev_matrix=None, p_entry=None, tau_scalar=None, use_escalator=True, escalator_step=0.012, free_trades=8, min_prob_floor=0.220, **kwargs):
         if isinstance(test_df_or_p, (pd.DataFrame, dict)):
             df = test_df_or_p
-            p = self.predict_entry(df) if p_entry is None else np.asarray(p_entry)
+            p = self.predict_entry(df) if p_entry is None else np.asarray(p_entry, dtype=float)
             mts = df['mt'].values if 'mt' in df else np.arange(len(p), dtype=float) * 100.0
         else:
-            p = np.asarray(test_df_or_p)
+            p = np.asarray(test_df_or_p, dtype=float)
             mts = np.arange(len(p), dtype=float) * 100.0
             
         tau = self.tau_scalar if tau_scalar is None else tau_scalar
@@ -870,29 +866,10 @@ class ChampionFixed5Engine:
             cur_mt = float(mts[idx])
             recent_24h_count = sum(1 for t in past_taken_mts if cur_mt - 86400.0 <= t < cur_mt)
             tau_eff = tau + (escalator_step * max(0, recent_24h_count - free_trades) if use_escalator else 0.0)
-            if p[idx] >= tau_eff:
+            if p[idx] >= tau_eff and p[idx] >= min_prob_floor:
                 final_tp[idx] = 5.0
                 past_taken_mts.append(cur_mt)
                 
-        cleared_trades = int((final_tp > 0).sum())
-        if cleared_trades < 3:
-            qualifying = [idx for idx in range(n) if p[idx] >= min_prob_floor]
-            if len(qualifying) == 0 and min_daily_trades > 0 and len(p) > 0:
-                qualifying = list(np.argsort(p)[::-1][:min_daily_trades])
-                
-            if len(qualifying) > 0:
-                qualifying_sorted = sorted(qualifying, key=lambda i: p[i], reverse=True)
-                target_count = min(max(min_daily_trades, cleared_trades), len(qualifying_sorted), max_daily_trades)
-                selected_set = set(qualifying_sorted[:target_count])
-                
-                final_tp = np.zeros(n, dtype=float)
-                past_taken_mts = []
-                for idx in sort_idx:
-                    cur_mt = float(mts[idx])
-                    if idx in selected_set:
-                        final_tp[idx] = 5.0
-                        past_taken_mts.append(cur_mt)
-                        
         ev_5 = p * 3.70 + (1.0 - p) * self.miss_payoff
         return final_tp, ev_5
 
@@ -966,7 +943,7 @@ for i, day in enumerate(eval_days, 1):
     tau_scalar = wf_engine.calibrate_scalar_threshold(trn, target_daily_trades=2.0, min_prob_floor=0.23)
     
     # Architecture B: Fixed TP=5
-    tp_f5, _ = wf_engine.decide_per_token(val, ev_matrix=ev_matrix, tau_scalar=tau_scalar, mode='fixed5')
+    tp_f5, _ = wf_engine.decide_per_token(val, ev_matrix=ev_matrix, tau_scalar=tau_scalar, min_prob_floor=0.220, escalator_step=0.012, free_trades=8)
     pnl_f5 = evaluate_pnl(mxs_val, fxs_val, tp_f5)
     f5_records.append({'day': day, 'taken': int((tp_f5 > 0).sum()), 'hits': int(((mxs_val >= 5.0) & (tp_f5 > 0)).sum()), 'pnl': pnl_f5})
     
@@ -1014,10 +991,10 @@ prod_engine.fit_entry(TR)
 print("Generating calibrated expected values and continuous TP allocations for test universe...")
 test_ev = prod_engine.calculate_expected_values(test_df=TE)
 
-tau_scalar = prod_engine.calibrate_scalar_threshold(TR, target_daily_trades=2.0, min_prob_floor=0.23)
+tau_scalar = prod_engine.calibrate_scalar_threshold(TR, min_prob_floor=0.220)
 print(f"Calibrated causal scalar cutoff: tau = {tau_scalar:.4f}")
 
-test_tp, best_ev = prod_engine.decide_per_token(TE, ev_matrix=test_ev, tau_scalar=tau_scalar, mode='fixed5')
+test_tp, best_ev = prod_engine.decide_per_token(TE, ev_matrix=test_ev, tau_scalar=tau_scalar, min_prob_floor=0.220, escalator_step=0.012, free_trades=8)
 
 sub = pd.DataFrame({'mint': TE['mint'], 'tp': test_tp})
 
