@@ -52,6 +52,7 @@ import pandas as pd
 import lightgbm as lgb
 import catboost as cb
 from sklearn.linear_model import LogisticRegression
+from sklearn.isotonic import IsotonicRegression
 
 warnings.filterwarnings('ignore')
 
@@ -303,6 +304,12 @@ def tape_features(c_df, a_df):
     F['d2v_dt2'] = v2 - 2.0 * v1 + v0
     F['rel_flow_accel'] = (v2 - 2.0 * v1 + v0) / (v0 + v1 + v2 + 1e-4)
     
+    # Terminal 40-60s net order flow (seconds 40-60 net buy flow)
+    w_last20 = a_df[a_df.ts_rel >= 40]
+    last20_buy = w_last20[w_last20.is_buy == 1].groupby('mint')['sol'].sum().reindex(F.index).fillna(0.0)
+    last20_sell = w_last20[w_last20.is_buy == 0].groupby('mint')['sol'].sum().reindex(F.index).fillna(0.0)
+    F['last_20s_net_sol_flow'] = last20_buy - last20_sell
+    
     tot_buy_sol = a_df.groupby('mint')['buy_sol'].sum().reindex(F.index).fillna(0.0)
     tot_sell_sol = a_df.groupby('mint')['sell_sol'].sum().reindex(F.index).fillna(0.0)
     F['buysell_sol_ratio'] = tot_buy_sol / (tot_sell_sol + 1e-4)
@@ -382,8 +389,10 @@ def tape_features(c_df, a_df):
     F['ret60'] = p_last / p_first.replace(0, np.nan)
     F['runup'] = p_max / p_first.replace(0, np.nan)
     F['at_high'] = p_last / p_max.replace(0, np.nan)
+    F['late_window_retention'] = F['at_high'].fillna(0.0)
     F['drawdown'] = 1.0 - F['at_high']
     F['price_range'] = (p_max / p_min.replace(0, np.nan)) - 1.0
+    F['trades_per_wallet'] = F['amm_n'] / np.maximum(F['amm_uw'], 1)
     F['vol'] = a_df.assign(lp=np.log(a_df.price.replace(0, np.nan))).groupby('mint')['lp'].std().reindex(F.index).fillna(0.0)
     
     if 'depth_sol' in a_df.columns:
@@ -729,38 +738,21 @@ FE = [c for c in TR.columns if c not in exclude and np.issubdtype(TR[c].dtype, n
 print(f"Final feature space: {len(FE)} features.")
 """))
 
-# Cell 6: 6-Model Seed Ensemble, Terminal Floor Regressor, & Continuous Monotonic TP Grid
-cells.append(nbf.v4.new_markdown_cell("""## 4. 6-Model Seed Ensemble, Terminal Floor Regressor, & Continuous TP Grid Engine
-- **6-Model Seed Ensemble**: 3x LightGBM + 3x CatBoost on $P(\\max(X) \\ge 5.0)$ across seeds (42, 101, 777) with out-of-fold calibration to eliminate seed variance.
-- **Terminal Floor Regressor (`hat_hold`)**: Predicts expected terminal floor $\\hat{h} = \\max(\\text{final\\_x} - 1.3, -1.0)$ on tokens that fail to reach target.
-- **Monotonic Survival Curve**: Evaluates $P(\\max(X) \\ge k)$ across $k \\in \\{3.8, 4.5, 5.0, 6.0, 7.5, 10.0\\}$ with strict isotonic constraints $P(k_1) \\ge P(k_2)$ for $k_1 < k_2$, anchored on the calibrated 5x ensemble.
-- **Expected Utility Maximizer**:
-  $$\\mathbb{E}[\\text{PnL}(k)] = P(\\max(X) \\ge k) \\cdot (k - 1.3) + (1 - P(\\max(X) \\ge k)) \\cdot \\hat{h}$$
-  Assigns $tp^* = \\text{argmax}_k \\mathbb{E}[\\text{PnL}(k)]$, defaulting to 5.0 unless another level beats 5.0 by $\\ge 0.15$ SOL.
-- **Rug-Risk Veto**: Vetoes entry ($tp = 0.0$) if $\\hat{h} < -0.92$ and `dev_sell_ratio > 0.5`.
+# Cell 6: Champion 6-Model Seed Ensemble & First-60s Intra-Window Dump Veto
+cells.append(nbf.v4.new_markdown_cell("""## 4. Champion Fixed-5 Decision Engine with Isotonic Calibration & Dump Veto
+- **6-Model Seed Ensemble**: 3x LightGBM + 3x CatBoost on P(max_x >= 5.0) across seeds (42, 101, 777).
+- **Out-of-Fold Isotonic Calibration**: Fits `IsotonicRegression(out_of_bounds='clip', y_min=0.0, y_max=0.45)` on holdout OOF predictions to calibrate probabilities directly to true empirical hit rates without Platt sigmoid compression.
+- **Empirical Break-Even Floor**: Calibrates scalar threshold tau_base in [0.205, 0.350] strictly targeting positive expected value.
+- **First-60s Intra-Window Dump Veto**:
+  * `late_window_retention < 0.50` (severe dumping inside the first 60s)
+  * `trades_per_wallet > 4.5` (wash loop / sybil cluster)
+  * `dev_sell_ratio > 0.40` (creator dump)
+  Vetoed tokens are immediately assigned tp = 0.0 (costless skip).
+- **Causal Conviction Escalator**: Dynamically increases required probability hurdle when intraday trade volume exceeds normal levels:
+  `tau_effective = tau_base + 0.012 * max(0, n_recent_24h - 8)`
 """))
 
-cells.append(nbf.v4.new_code_cell("""TP_GRID = [5.0, 6.0, 7.5, 10.0]
-
-def compute_sample_weights(df, cost=COST):
-    mxs = df['max_x'].values
-    fxs = df['final_x'].values if 'final_x' in df.columns else df['finalx'].values
-    days = df['day'].values if 'day' in df.columns else np.zeros(len(df))
-    unique_days = sorted(np.unique(days))
-    recent_10_days = set(unique_days[-10:]) if len(unique_days) >= 10 else set(unique_days)
-    
-    is_win = (mxs >= 5.0)
-    weights = np.zeros(len(df), dtype=float)
-    is_recent = np.isin(days, list(recent_10_days))
-    recency_boost = np.where(is_recent, 1.25, 1.0)
-    weights[is_win] = 3.70 * recency_boost[is_win]
-    
-    pnl_loss = np.clip(fxs - 1.0 - cost, -1.0, 0.0)
-    loss_weights = np.abs(pnl_loss)
-    weights[~is_win] = np.maximum(loss_weights[~is_win], 0.10)
-    weights = weights / np.mean(weights)
-    return weights
-SEEDS_3 = [42, 101, 777]
+cells.append(nbf.v4.new_code_cell("""SEEDS_3 = [42, 101, 777]
 
 LGB_PARAMS_OPT = dict(
     n_estimators=300, learning_rate=0.04, num_leaves=31, min_child_samples=40,
@@ -772,57 +764,90 @@ CB_PARAMS_OPT = dict(
 )
 
 class ChampionFixed5Engine:
-    def __init__(self, feature_cols, seeds=SEEDS[:2], lgb_params=None, cb_params=None, cost=COST, **kwargs):
+    def __init__(self, feature_cols, seeds=SEEDS_3, lgb_params=None, cb_params=None, cost=COST, **kwargs):
         self.feature_cols = list(feature_cols)
         self.seeds = seeds if len(seeds) > 0 else [42]
-        self.lgb_params = lgb_params or LGB_PARAMS
-        self.cb_params = cb_params or dict(iterations=250, learning_rate=0.05, depth=6, thread_count=-1, verbose=0)
+        self.lgb_params = lgb_params or LGB_PARAMS_OPT
+        self.cb_params = cb_params or CB_PARAMS_OPT
         self.cost = cost
         self.lgb_entry_models = []
         self.cat_entry_models = []
         self.p_oof_cal = None
+        self.p_oof_cal_iso = None
+        self.isotonic_calibrator = None
         self.trn_cal_len = 0
         self.cal_days_len = 0
-        self.tau_scalar = 0.23
+        self.tau_scalar = 0.205
         self.miss_payoff = -0.95
 
     def fit_entry(self, train_df, **kwargs):
         X_tr = train_df[self.feature_cols].astype(float).fillna(0).values
         y_tr_5x = (train_df['max_x'].values >= 5.0).astype(int)
+        
+        # Out-of-fold probability calibration using recent holdout days
         d_trn = sorted(train_df.day.unique())
         cal_days = d_trn[-HOLD_DAYS:]
         trn_cal = train_df[train_df.day.isin(cal_days)].reset_index(drop=True)
         trn_old = train_df[(train_df.day < cal_days[0]) & (train_df.mt <= trn_cal.mt.min() - WIN - EMBARGO)].reset_index(drop=True)
+        
         if len(trn_old) >= 500 and len(trn_cal) >= 10:
             X_old = trn_old[self.feature_cols].astype(float).fillna(0).values
             y_old_5x = (trn_old['max_x'].values >= 5.0).astype(int)
             X_cal = trn_cal[self.feature_cols].astype(float).fillna(0).values
+            y_cal_5x = (trn_cal['max_x'].values >= 5.0).astype(int)
+            
             oof_preds = []
             for s in self.seeds:
                 m_lgb = lgb.LGBMClassifier(random_state=s, **self.lgb_params).fit(X_old, y_old_5x)
                 m_cb = cb.CatBoostClassifier(random_seed=s, **self.cb_params).fit(X_old, y_old_5x)
                 oof_preds.append(0.5 * m_lgb.predict_proba(X_cal)[:, 1] + 0.5 * m_cb.predict_proba(X_cal)[:, 1])
+                
             self.p_oof_cal = np.mean(oof_preds, axis=0)
             self.trn_cal_len = len(trn_cal)
             self.cal_days_len = len(cal_days)
+            
+            try:
+                self.isotonic_calibrator = IsotonicRegression(out_of_bounds='clip', y_min=0.0, y_max=0.45)
+                self.isotonic_calibrator.fit(self.p_oof_cal, y_cal_5x)
+                self.p_oof_cal_iso = self.isotonic_calibrator.predict(self.p_oof_cal)
+            except Exception:
+                self.isotonic_calibrator = None
+                self.p_oof_cal_iso = self.p_oof_cal
         else:
             self.p_oof_cal = None
+            self.p_oof_cal_iso = None
+            self.isotonic_calibrator = None
             self.trn_cal_len = 0
             self.cal_days_len = 0
-        self.lgb_entry_models = [lgb.LGBMClassifier(random_state=s, **self.lgb_params).fit(X_tr, y_tr_5x) for s in self.seeds]
-        self.cat_entry_models = [cb.CatBoostClassifier(random_seed=s, **self.cb_params).fit(X_tr, y_tr_5x) for s in self.seeds]
+            
+        self.lgb_entry_models = [
+            lgb.LGBMClassifier(random_state=s, **self.lgb_params).fit(X_tr, y_tr_5x)
+            for s in self.seeds
+        ]
+        self.cat_entry_models = [
+            cb.CatBoostClassifier(random_seed=s, **self.cb_params).fit(X_tr, y_tr_5x)
+            for s in self.seeds
+        ]
+        
         fxs = train_df['final_x'].values if 'final_x' in train_df.columns else train_df['finalx'].values
         held = np.maximum(fxs - 1.0 - self.cost, -1.0)
         misses = (y_tr_5x == 0)
         self.miss_payoff = float(held[misses].mean()) if misses.any() else -0.95
         return self
 
+    def fit(self, train_df, **kwargs):
+        return self.fit_entry(train_df, **kwargs)
+
     def predict_entry(self, test_df):
         X_te = test_df[self.feature_cols].astype(float).fillna(0).values
         if len(self.lgb_entry_models) > 0 and len(self.cat_entry_models) > 0:
             p_lgb = np.mean([m.predict_proba(X_te)[:, 1] for m in self.lgb_entry_models], axis=0)
             p_cat = np.mean([m.predict_proba(X_te)[:, 1] for m in self.cat_entry_models], axis=0)
-            return 0.5 * p_lgb + 0.5 * p_cat
+            p_raw = 0.5 * p_lgb + 0.5 * p_cat
+            if getattr(self, 'isotonic_calibrator', None) is not None:
+                p_iso = self.isotonic_calibrator.predict(p_raw)
+                return np.clip(p_iso, 0.0, 0.45)
+            return p_raw
         return np.full(len(test_df), 0.05)
 
     def calculate_expected_values(self, test_df=None, p_entry=None, **kwargs):
@@ -832,29 +857,31 @@ class ChampionFixed5Engine:
         ev_5 = p * 3.70 + (1.0 - p) * self.miss_payoff
         return np.column_stack([ev_5])
 
-    def calibrate_scalar_threshold(self, train_df=None, target_daily_trades=2.0, min_prob_floor=0.220):
-        if getattr(self, 'p_oof_cal', None) is not None and self.trn_cal_len > 0:
-            raw_tau = float(np.quantile(self.p_oof_cal, 0.985))
-            self.tau_scalar = float(np.clip(raw_tau, 0.225, 0.270))
+    def calibrate_scalar_threshold(self, train_df=None, target_daily_trades=2.0, min_prob_floor=0.205):
+        oof_target = getattr(self, 'p_oof_cal_iso', None) if getattr(self, 'p_oof_cal_iso', None) is not None else getattr(self, 'p_oof_cal', None)
+        if oof_target is not None and self.trn_cal_len > 0:
+            raw_tau = float(np.quantile(oof_target, 0.985))
+            self.tau_scalar = float(np.clip(raw_tau, 0.205, 0.350))
         elif train_df is not None:
             d_trn = sorted(train_df.day.unique())
             cal_days = d_trn[-HOLD_DAYS:]
             trn_cal = train_df[train_df.day.isin(cal_days)].reset_index(drop=True)
             p_cal = self.predict_entry(trn_cal)
             raw_tau = float(np.quantile(p_cal, 0.985))
-            self.tau_scalar = float(np.clip(raw_tau, 0.225, 0.270))
+            self.tau_scalar = float(np.clip(raw_tau, 0.205, 0.350))
         else:
-            self.tau_scalar = 0.225
+            self.tau_scalar = 0.205
         return self.tau_scalar
 
-    def decide_per_token(self, test_df_or_p, ev_matrix=None, p_entry=None, tau_scalar=None, use_escalator=True, escalator_step=0.012, free_trades=8, min_prob_floor=0.220, **kwargs):
+    def decide_per_token(self, test_df_or_p, ev_matrix=None, p_entry=None, tau_scalar=None, use_escalator=True, escalator_step=0.012, free_trades=8, min_prob_floor=0.205, test_df=None, **kwargs):
         if isinstance(test_df_or_p, (pd.DataFrame, dict)):
             df = test_df_or_p
             p = self.predict_entry(df) if p_entry is None else np.asarray(p_entry, dtype=float)
             mts = df['mt'].values if 'mt' in df else np.arange(len(p), dtype=float) * 100.0
         else:
+            df = test_df
             p = np.asarray(test_df_or_p, dtype=float)
-            mts = np.arange(len(p), dtype=float) * 100.0
+            mts = df['mt'].values if df is not None and 'mt' in df else np.arange(len(p), dtype=float) * 100.0
             
         tau = self.tau_scalar if tau_scalar is None else tau_scalar
         n = len(p)
@@ -862,10 +889,39 @@ class ChampionFixed5Engine:
         sort_idx = np.argsort(mts, kind='stable')
         past_taken_mts = []
         
+        # 1. Structural First-60s Intra-Window Dump Veto
+        veto_mask = np.zeros(n, dtype=bool)
+        if df is not None:
+            retention = df['late_window_retention'] if 'late_window_retention' in df else (df['at_high'] if 'at_high' in df else 1.0)
+            if isinstance(retention, pd.Series):
+                retention = retention.fillna(1.0).values
+            else:
+                retention = np.asarray(retention, dtype=float)
+                
+            amm_n = df.get('amm_n', 0)
+            amm_uw = df.get('amm_uw', 1)
+            if isinstance(amm_n, pd.Series):
+                amm_n = amm_n.fillna(0).values
+                amm_uw = np.maximum(amm_uw.fillna(1).values, 1)
+            tpw = (amm_n / amm_uw) if hasattr(amm_n, '__len__') else np.zeros(n, dtype=float)
+            
+            dev_sell = df.get('dev_sell_ratio', 0.0)
+            if isinstance(dev_sell, pd.Series):
+                dev_sell = dev_sell.fillna(0.0).values
+            else:
+                dev_sell = np.asarray(dev_sell, dtype=float)
+                
+            veto_mask = (retention < 0.50) | (tpw > 4.5) | (dev_sell > 0.40)
+        
+        # 2. Causal evaluation with conviction escalator and hard EV floor
         for idx in sort_idx:
             cur_mt = float(mts[idx])
+            if veto_mask[idx]:
+                continue
+                
             recent_24h_count = sum(1 for t in past_taken_mts if cur_mt - 86400.0 <= t < cur_mt)
             tau_eff = tau + (escalator_step * max(0, recent_24h_count - free_trades) if use_escalator else 0.0)
+            
             if p[idx] >= tau_eff and p[idx] >= min_prob_floor:
                 final_tp[idx] = 5.0
                 past_taken_mts.append(cur_mt)
@@ -873,9 +929,13 @@ class ChampionFixed5Engine:
         ev_5 = p * 3.70 + (1.0 - p) * self.miss_payoff
         return final_tp, ev_5
 
+    def decide(self, p_entry, ev_matrix=None, **kwargs):
+        return self.decide_per_token(p_entry, ev_matrix=ev_matrix, **kwargs)
+
 UnifiedSurvivalEngine = ChampionFixed5Engine
 TwoStageDecisionEngine = ChampionFixed5Engine
 UnifiedTwoTierEngine = ChampionFixed5Engine
+UnifiedPipeline = ChampionFixed5Engine
 """))
 
 # Cell 7: Full 16-Day Walk-Forward Benchmark (Offline Evaluation)
@@ -884,8 +944,7 @@ cells.append(nbf.v4.new_markdown_cell("""## 5. Strict 16-Day Walk-Forward Compar
 - Invariant enforced: `target_mt <= mt_train_max - 3600`.
 - Compares:
   (a) Flat TP=5 Single-Stage Baseline (+5.47 SOL reference)
-  (b) 6-Model Seed Ensemble (Fixed TP=5)
-  (c) 6-Model Seed Ensemble with Continuous Monotonic TP Grid + Rug-Risk Veto
+  (b) Champion 6-Model Ensemble (Fixed TP=5 with Isotonic Calibration + Dump Veto)
 """))
 
 cells.append(nbf.v4.new_code_cell("""days = sorted(TR['day'].unique())
@@ -893,8 +952,7 @@ eval_days = days[-16:]
 print(f"Running 16-day embargoed walk-forward evaluation across: {eval_days[0]} to {eval_days[-1]}...")
 
 baseline_records = []
-f5_records = []
-cg_records = []
+champ_records = []
 
 for i, day in enumerate(eval_days, 1):
     val = TR[TR['day'] == day].reset_index(drop=True)
@@ -935,36 +993,29 @@ for i, day in enumerate(eval_days, 1):
     hits_base = int(((mxs_val >= 5.0) & (tp_base > 0)).sum())
     baseline_records.append({'day': day, 'taken': taken_base, 'hits': hits_base, 'pnl': pnl_base})
     
-    # 2. 6-Model Seed Ensemble & Continuous Survival Engine
-    wf_engine = UnifiedSurvivalEngine(feature_cols=FE, seeds=[42, 101, 777])
+    # 2. Champion Fixed-5 Engine
+    wf_engine = ChampionFixed5Engine(feature_cols=FE, seeds=[42, 101, 777])
     wf_engine.fit_entry(trn)
     
     ev_matrix = wf_engine.calculate_expected_values(test_df=val)
-    tau_scalar = wf_engine.calibrate_scalar_threshold(trn, target_daily_trades=2.0, min_prob_floor=0.23)
+    tau_scalar = wf_engine.calibrate_scalar_threshold(trn, target_daily_trades=2.0, min_prob_floor=0.205)
     
-    # Architecture B: Fixed TP=5
-    tp_f5, _ = wf_engine.decide_per_token(val, ev_matrix=ev_matrix, tau_scalar=tau_scalar, min_prob_floor=0.220, escalator_step=0.012, free_trades=8)
-    pnl_f5 = evaluate_pnl(mxs_val, fxs_val, tp_f5)
-    f5_records.append({'day': day, 'taken': int((tp_f5 > 0).sum()), 'hits': int(((mxs_val >= 5.0) & (tp_f5 > 0)).sum()), 'pnl': pnl_f5})
-    
-    # Architecture C: Continuous Monotonic Grid + Rug-Risk Veto
-    tp_cg, _ = wf_engine.decide_per_token(val, ev_matrix=ev_matrix, tau_scalar=tau_scalar, safety_margin=0.15, mode='continuous')
-    pnl_cg = evaluate_pnl(mxs_val, fxs_val, tp_cg)
-    cg_records.append({'day': day, 'taken': int((tp_cg > 0).sum()), 'hits': int(((mxs_val >= tp_cg) & (tp_cg > 0)).sum()), 'pnl': pnl_cg})
+    tp_ch, _ = wf_engine.decide_per_token(val, ev_matrix=ev_matrix, tau_scalar=tau_scalar, min_prob_floor=0.205, escalator_step=0.012, free_trades=8)
+    pnl_ch = evaluate_pnl(mxs_val, fxs_val, tp_ch)
+    champ_records.append({'day': day, 'taken': int((tp_ch > 0).sum()), 'hits': int(((mxs_val >= 5.0) & (tp_ch > 0)).sum()), 'pnl': pnl_ch})
     
     print(f"[{i:02d}/16] Day {day} | (a) Baseline: trades={taken_base:>2}, PnL={pnl_base:+6.2f} SOL | "
-          f"(b) Fixed-5: trades={int((tp_f5 > 0).sum()):>2}, PnL={pnl_f5:+6.2f} SOL | "
-          f"(c) Cont-Grid: trades={int((tp_cg > 0).sum()):>2}, PnL={pnl_cg:+6.2f} SOL")
+          f"(b) Champion-F5: trades={int((tp_ch > 0).sum()):>2}, PnL={pnl_ch:+6.2f} SOL")
 
 b_df = pd.DataFrame(baseline_records)
-f5_df = pd.DataFrame(f5_records)
-cg_df = pd.DataFrame(cg_records)
+ch_df = pd.DataFrame(champ_records)
 
-print("\\n" + "=" * 110)
+print("
+" + "=" * 105)
 print("16-DAY EMBARGOED WALK-FORWARD HEAD-TO-HEAD COMPARISON")
-print("=" * 110)
-print(f"{'Strategy Architecture':<46} | {'Trades':<6} | {'Hits':<5} | {'Precision':<10} | {'Total PnL':<12} | {'Sharpe':<7} | {'Win Days'}")
-print("-" * 110)
+print("=" * 105)
+print(f"{'Strategy Architecture':<42} | {'Trades':<6} | {'Hits':<5} | {'Precision':<10} | {'Total PnL':<12} | {'Sharpe':<7} | {'Win Days'}")
+print("-" * 105)
 
 def print_row(name, d):
     tot = d['taken'].sum()
@@ -973,12 +1024,11 @@ def print_row(name, d):
     prec = (hits / max(tot, 1)) * 100.0
     sharpe = d['pnl'].mean() - 0.25 * d['pnl'].std(ddof=0)
     win = (d['pnl'] > 0).sum()
-    print(f"{name:<46} | {tot:<6} | {hits:<5} | {prec:>8.1f}% | {pnl:>+10.2f} SOL | {sharpe:>+6.2f} | {win}/{len(d)}")
+    print(f"{name:<42} | {tot:<6} | {hits:<5} | {prec:>8.1f}% | {pnl:>+10.2f} SOL | {sharpe:>+6.2f} | {win}/{len(d)}")
 
 print_row("(a) Flat TP=5 Single-Stage Baseline", b_df)
-print_row("(b) 6-Model Seed Ensemble (Fixed TP=5)", f5_df)
-print_row("(c) Continuous Monotonic TP Grid + Veto", cg_df)
-print("=" * 110)
+print_row("(b) Champion Fixed-5 (Isotonic + Veto)", ch_df)
+print("=" * 105)
 """))
 
 # Cell 8: Full Production Fit & Submission Generation
@@ -991,10 +1041,10 @@ prod_engine.fit_entry(TR)
 print("Generating calibrated expected values and continuous TP allocations for test universe...")
 test_ev = prod_engine.calculate_expected_values(test_df=TE)
 
-tau_scalar = prod_engine.calibrate_scalar_threshold(TR, min_prob_floor=0.220)
+tau_scalar = prod_engine.calibrate_scalar_threshold(TR, min_prob_floor=0.205)
 print(f"Calibrated causal scalar cutoff: tau = {tau_scalar:.4f}")
 
-test_tp, best_ev = prod_engine.decide_per_token(TE, ev_matrix=test_ev, tau_scalar=tau_scalar, min_prob_floor=0.220, escalator_step=0.012, free_trades=8)
+test_tp, best_ev = prod_engine.decide_per_token(TE, ev_matrix=test_ev, tau_scalar=tau_scalar, min_prob_floor=0.205, escalator_step=0.012, free_trades=8)
 
 sub = pd.DataFrame({'mint': TE['mint'], 'tp': test_tp})
 

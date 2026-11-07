@@ -149,6 +149,12 @@ def extract_tape_features(c_df, a_df):
     F['d2v_dt2'] = v2 - 2.0 * v1 + v0
     F['rel_flow_accel'] = (v2 - 2.0 * v1 + v0) / (v0 + v1 + v2 + 1e-4)
     
+    # Terminal 40-60s net order flow (seconds 40-60 net buy flow)
+    w_last20 = a_df[a_df.ts_rel >= 40]
+    last20_buy = w_last20[w_last20.is_buy == 1].groupby('mint')['sol'].sum().reindex(F.index).fillna(0.0)
+    last20_sell = w_last20[w_last20.is_buy == 0].groupby('mint')['sol'].sum().reindex(F.index).fillna(0.0)
+    F['last_20s_net_sol_flow'] = last20_buy - last20_sell
+    
     # Buy / Sell Flow dynamics
     tot_buy_sol = a_df.groupby('mint')['buy_sol'].sum().reindex(F.index).fillna(0.0)
     tot_sell_sol = a_df.groupby('mint')['sell_sol'].sum().reindex(F.index).fillna(0.0)
@@ -238,8 +244,10 @@ def extract_tape_features(c_df, a_df):
     F['ret60'] = p_last / p_first.replace(0, np.nan)
     F['runup'] = p_max / p_first.replace(0, np.nan)
     F['at_high'] = p_last / p_max.replace(0, np.nan)
+    F['late_window_retention'] = F['at_high'].fillna(0.0)
     F['drawdown'] = 1.0 - F['at_high']
     F['price_range'] = (p_max / p_min.replace(0, np.nan)) - 1.0
+    F['trades_per_wallet'] = F['amm_n'] / np.maximum(F['amm_uw'], 1)
     
     F['vol'] = a_df.assign(lp=np.log(a_df.price.replace(0, np.nan))).groupby('mint')['lp'].std().reindex(F.index).fillna(0.0)
     
