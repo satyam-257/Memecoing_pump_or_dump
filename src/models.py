@@ -125,16 +125,12 @@ class ChampionFixed5Engine:
         return self.fit_entry(train_df, **kwargs)
 
     def predict_entry(self, test_df):
-        """Predicts empirical probability P(max_x >= 5.0) as unweighted ensemble average with isotonic calibration."""
+        """Predicts empirical probability P(max_x >= 5.0) as unweighted ensemble average of LightGBM + CatBoost."""
         X_te = test_df[self.feature_cols].astype(float).fillna(0).values
         if len(self.lgb_entry_models) > 0 and len(self.cat_entry_models) > 0:
             p_lgb = np.mean([m.predict_proba(X_te)[:, 1] for m in self.lgb_entry_models], axis=0)
             p_cat = np.mean([m.predict_proba(X_te)[:, 1] for m in self.cat_entry_models], axis=0)
-            p_raw = 0.5 * p_lgb + 0.5 * p_cat
-            if getattr(self, 'isotonic_calibrator', None) is not None:
-                p_iso = self.isotonic_calibrator.predict(p_raw)
-                return np.clip(p_iso, 0.0, 0.45)
-            return p_raw
+            return 0.5 * p_lgb + 0.5 * p_cat
         return np.full(len(test_df), 0.05)
 
     def predict_levels(self, test_df):
@@ -157,39 +153,42 @@ class ChampionFixed5Engine:
         ev_5 = p * 3.70 + (1.0 - p) * self.miss_payoff
         return np.column_stack([ev_5])
 
-    def calibrate_scalar_threshold(self, train_df=None, target_daily_trades=2.0, min_prob_floor=0.205):
+    def calibrate_scalar_threshold(self, train_df=None, target_daily_trades=2.0, min_prob_floor=0.220):
         """
-        Calibrates tau_base strictly on holdout training days (last 5 days OOF) targeting empirical break-even floor:
-        tau_base = np.clip(np.quantile(oof_probs_last_5d, 0.985), 0.205, 0.350).
+        Calibrates tau_base strictly on holdout training days (last 5 days OOF) targeting ~1.5 - 2.0 trades/day:
+        tau_base = np.clip(np.quantile(oof_probs_last_5d, 1.0 - q), min_prob_floor, 0.350).
         """
-        oof_target = getattr(self, 'p_oof_cal_iso', None) if getattr(self, 'p_oof_cal_iso', None) is not None else getattr(self, 'p_oof_cal', None)
-        if oof_target is not None and self.trn_cal_len > 0:
-            raw_tau = float(np.quantile(oof_target, 0.985))
-            self.tau_scalar = float(np.clip(raw_tau, 0.205, 0.350))
+        if getattr(self, 'p_oof_cal', None) is not None and self.trn_cal_len > 0:
+            avg_tokens_per_day = max(self.trn_cal_len / float(self.cal_days_len), 10.0)
+            q = min(max(target_daily_trades / avg_tokens_per_day, 0.001), 0.05)
+            raw_tau = float(np.quantile(self.p_oof_cal, 1.0 - q))
+            self.tau_scalar = float(np.clip(raw_tau, min_prob_floor, 0.350))
         elif train_df is not None:
             d_trn = sorted(train_df.day.unique())
             cal_days = d_trn[-HOLD_DAYS:]
             trn_cal = train_df[train_df.day.isin(cal_days)].reset_index(drop=True)
             p_cal = self.predict_entry(trn_cal)
-            raw_tau = float(np.quantile(p_cal, 0.985))
-            self.tau_scalar = float(np.clip(raw_tau, 0.205, 0.350))
+            avg_tokens_per_day = max(len(trn_cal) / float(len(cal_days)), 10.0)
+            q = min(max(target_daily_trades / avg_tokens_per_day, 0.001), 0.05)
+            raw_tau = float(np.quantile(p_cal, 1.0 - q))
+            self.tau_scalar = float(np.clip(raw_tau, min_prob_floor, 0.350))
         else:
-            self.tau_scalar = 0.205
+            self.tau_scalar = min_prob_floor
         return self.tau_scalar
 
-    def decide_per_token(self, test_df_or_p, ev_matrix=None, p_entry=None, tau_scalar=None, use_escalator=True, escalator_step=0.012, free_trades=8, min_prob_floor=0.205, test_df=None, **kwargs):
+    def decide_per_token(self, test_df_or_p, ev_matrix=None, p_entry=None, tau_scalar=None, use_escalator=True, escalator_step=0.012, free_trades=4, min_prob_floor=0.220, test_df=None, **kwargs):
         """
-        Causal per-token execution rule with First-60s Intra-Window Dump Veto and causal conviction escalator:
+        Causal per-token execution rule with First-60s Real Dump Veto and causal conviction escalator:
         - Evaluates test tokens strictly in chronological order of mt (zero future peeking).
-        - Tracks the rolling count of entries taken in the trailing 24 hours: n_recent_24h.
-        - For every trade taken in trailing 24h beyond free_trades (8), dynamically escalates required hurdle:
-            tau_effective = tau_base + escalator_step * max(0, n_recent_24h - 8)
-        - FIRST-60s INTRA-WINDOW DUMP VETO:
-            * late_window_retention < 0.50 (dumping inside first 60s)
-            * trades_per_wallet > 4.5 (wash loop)
-            * dev_sell_ratio > 0.40 (creator dumping)
+        - Tracks rolling count of entries taken in trailing 24 hours: n_recent_24h.
+        - For every trade taken in trailing 24h beyond free_trades (4), dynamically escalates required hurdle:
+            tau_effective = tau_base + escalator_step * max(0, n_recent_24h - 4)
+        - REAL DUMP VETO:
+            * late_window_retention < 0.50 (price collapsed by >50% within first 60s)
+            * trades_per_wallet > 4.5 (wash loop / sybil cluster)
+            * dev_share > 0.30 (creator sold >30% of total AMM liquidity)
             Any vetoed token is strictly assigned tp = 0.0 (costless skip).
-        - STRICT SAFETY FLOOR: NEVER enter a trade unless p[idx] >= min_prob_floor (0.205).
+        - STRICT SAFETY FLOOR: NEVER enter a trade unless p[idx] >= min_prob_floor (0.220).
         - If unvetoed and p[idx] >= tau_effective and p[idx] >= min_prob_floor: enters trade at tp = 5.0.
         - Else: skips trade at zero cost (tp = 0.0).
         """
@@ -208,7 +207,7 @@ class ChampionFixed5Engine:
         sort_idx = np.argsort(mts, kind='stable')
         past_taken_mts = []
         
-        # 1. Structural First-60s Intra-Window Dump Veto
+        # 1. Structural First-60s Real Dump Veto
         veto_mask = np.zeros(n, dtype=bool)
         if df is not None:
             retention = df['late_window_retention'] if 'late_window_retention' in df else (df['at_high'] if 'at_high' in df else 1.0)
@@ -224,13 +223,20 @@ class ChampionFixed5Engine:
                 amm_uw = np.maximum(amm_uw.fillna(1).values, 1)
             tpw = (amm_n / amm_uw) if hasattr(amm_n, '__len__') else np.zeros(n, dtype=float)
             
-            dev_sell = df.get('dev_sell_ratio', 0.0)
-            if isinstance(dev_sell, pd.Series):
-                dev_sell = dev_sell.fillna(0.0).values
+            dev_sell_sol = df.get('creator_sell_sol', 0.0)
+            if isinstance(dev_sell_sol, pd.Series):
+                dev_sell_sol = dev_sell_sol.fillna(0.0).values
             else:
-                dev_sell = np.asarray(dev_sell, dtype=float)
+                dev_sell_sol = np.asarray(dev_sell_sol, dtype=float)
                 
-            veto_mask = (retention < 0.50) | (tpw > 4.5) | (dev_sell > 0.40)
+            amm_sol = df.get('amm_sol', 1.0)
+            if isinstance(amm_sol, pd.Series):
+                amm_sol = amm_sol.fillna(1.0).values
+            else:
+                amm_sol = np.asarray(amm_sol, dtype=float)
+                
+            dev_share = dev_sell_sol / (amm_sol + 1e-4)
+            veto_mask = (retention < 0.50) | (tpw > 4.5) | (dev_share > 0.30)
         
         # 2. Causal evaluation with conviction escalator and hard EV floor
         for idx in sort_idx:
@@ -242,7 +248,7 @@ class ChampionFixed5Engine:
             recent_24h_count = sum(1 for t in past_taken_mts if cur_mt - 86400.0 <= t < cur_mt)
             tau_eff = tau + (escalator_step * max(0, recent_24h_count - free_trades) if use_escalator else 0.0)
             
-            # Enforce hard safety condition: NEVER buy below min_prob_floor (0.205)
+            # Enforce hard safety condition: NEVER buy below min_prob_floor (0.220)
             if p[idx] >= tau_eff and p[idx] >= min_prob_floor:
                 final_tp[idx] = 5.0
                 past_taken_mts.append(cur_mt)

@@ -37,3 +37,6 @@ catboost_info/
 *.zip
 *.parquet
 
+
+# Temporary scratch scripts
+scratch/

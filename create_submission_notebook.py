@@ -843,11 +843,7 @@ class ChampionFixed5Engine:
         if len(self.lgb_entry_models) > 0 and len(self.cat_entry_models) > 0:
             p_lgb = np.mean([m.predict_proba(X_te)[:, 1] for m in self.lgb_entry_models], axis=0)
             p_cat = np.mean([m.predict_proba(X_te)[:, 1] for m in self.cat_entry_models], axis=0)
-            p_raw = 0.5 * p_lgb + 0.5 * p_cat
-            if getattr(self, 'isotonic_calibrator', None) is not None:
-                p_iso = self.isotonic_calibrator.predict(p_raw)
-                return np.clip(p_iso, 0.0, 0.45)
-            return p_raw
+            return 0.5 * p_lgb + 0.5 * p_cat
         return np.full(len(test_df), 0.05)
 
     def calculate_expected_values(self, test_df=None, p_entry=None, **kwargs):
@@ -857,23 +853,26 @@ class ChampionFixed5Engine:
         ev_5 = p * 3.70 + (1.0 - p) * self.miss_payoff
         return np.column_stack([ev_5])
 
-    def calibrate_scalar_threshold(self, train_df=None, target_daily_trades=2.0, min_prob_floor=0.205):
-        oof_target = getattr(self, 'p_oof_cal_iso', None) if getattr(self, 'p_oof_cal_iso', None) is not None else getattr(self, 'p_oof_cal', None)
-        if oof_target is not None and self.trn_cal_len > 0:
-            raw_tau = float(np.quantile(oof_target, 0.985))
-            self.tau_scalar = float(np.clip(raw_tau, 0.205, 0.350))
+    def calibrate_scalar_threshold(self, train_df=None, target_daily_trades=2.0, min_prob_floor=0.220):
+        if getattr(self, 'p_oof_cal', None) is not None and self.trn_cal_len > 0:
+            avg_tokens_per_day = max(self.trn_cal_len / float(self.cal_days_len), 10.0)
+            q = min(max(target_daily_trades / avg_tokens_per_day, 0.001), 0.05)
+            raw_tau = float(np.quantile(self.p_oof_cal, 1.0 - q))
+            self.tau_scalar = float(np.clip(raw_tau, min_prob_floor, 0.350))
         elif train_df is not None:
             d_trn = sorted(train_df.day.unique())
             cal_days = d_trn[-HOLD_DAYS:]
             trn_cal = train_df[train_df.day.isin(cal_days)].reset_index(drop=True)
             p_cal = self.predict_entry(trn_cal)
-            raw_tau = float(np.quantile(p_cal, 0.985))
-            self.tau_scalar = float(np.clip(raw_tau, 0.205, 0.350))
+            avg_tokens_per_day = max(len(trn_cal) / float(len(cal_days)), 10.0)
+            q = min(max(target_daily_trades / avg_tokens_per_day, 0.001), 0.05)
+            raw_tau = float(np.quantile(p_cal, 1.0 - q))
+            self.tau_scalar = float(np.clip(raw_tau, min_prob_floor, 0.350))
         else:
-            self.tau_scalar = 0.205
+            self.tau_scalar = min_prob_floor
         return self.tau_scalar
 
-    def decide_per_token(self, test_df_or_p, ev_matrix=None, p_entry=None, tau_scalar=None, use_escalator=True, escalator_step=0.012, free_trades=8, min_prob_floor=0.205, test_df=None, **kwargs):
+    def decide_per_token(self, test_df_or_p, ev_matrix=None, p_entry=None, tau_scalar=None, use_escalator=True, escalator_step=0.012, free_trades=4, min_prob_floor=0.220, test_df=None, **kwargs):
         if isinstance(test_df_or_p, (pd.DataFrame, dict)):
             df = test_df_or_p
             p = self.predict_entry(df) if p_entry is None else np.asarray(p_entry, dtype=float)
@@ -889,7 +888,7 @@ class ChampionFixed5Engine:
         sort_idx = np.argsort(mts, kind='stable')
         past_taken_mts = []
         
-        # 1. Structural First-60s Intra-Window Dump Veto
+        # 1. Structural First-60s Real Dump Veto
         veto_mask = np.zeros(n, dtype=bool)
         if df is not None:
             retention = df['late_window_retention'] if 'late_window_retention' in df else (df['at_high'] if 'at_high' in df else 1.0)
@@ -905,13 +904,20 @@ class ChampionFixed5Engine:
                 amm_uw = np.maximum(amm_uw.fillna(1).values, 1)
             tpw = (amm_n / amm_uw) if hasattr(amm_n, '__len__') else np.zeros(n, dtype=float)
             
-            dev_sell = df.get('dev_sell_ratio', 0.0)
-            if isinstance(dev_sell, pd.Series):
-                dev_sell = dev_sell.fillna(0.0).values
+            dev_sell_sol = df.get('creator_sell_sol', 0.0)
+            if isinstance(dev_sell_sol, pd.Series):
+                dev_sell_sol = dev_sell_sol.fillna(0.0).values
             else:
-                dev_sell = np.asarray(dev_sell, dtype=float)
+                dev_sell_sol = np.asarray(dev_sell_sol, dtype=float)
                 
-            veto_mask = (retention < 0.50) | (tpw > 4.5) | (dev_sell > 0.40)
+            amm_sol = df.get('amm_sol', 1.0)
+            if isinstance(amm_sol, pd.Series):
+                amm_sol = amm_sol.fillna(1.0).values
+            else:
+                amm_sol = np.asarray(amm_sol, dtype=float)
+                
+            dev_share = dev_sell_sol / (amm_sol + 1e-4)
+            veto_mask = (retention < 0.50) | (tpw > 4.5) | (dev_share > 0.30)
         
         # 2. Causal evaluation with conviction escalator and hard EV floor
         for idx in sort_idx:
@@ -1052,11 +1058,11 @@ sample_path = f'{DATA}/sample_submission.csv'
 if os.path.exists(sample_path):
     sample_sub = pd.read_csv(sample_path)
     sub = sample_sub[['mint']].merge(sub, on='mint', how='left')
-    sub['tp'] = sub['tp'].fillna(0.0).astype(float)
+    sub['tp'] = sub['tp'].fillna(0).astype(int)
     assert len(sub) == len(sample_sub), f"Row count mismatch: {len(sub)} vs {len(sample_sub)}"
     assert sub['mint'].equals(sample_sub['mint']), "Mint alignment mismatch"
 
-valid_mask = (sub['tp'] == 0.0) | ((sub['tp'] >= 3.0) & (sub['tp'] <= 100.0))
+valid_mask = (sub['tp'] == 0) | ((sub['tp'] >= 3) & (sub['tp'] <= 100))
 assert valid_mask.all(), "Invalid take-profit values detected outside allowed bounds."
 
 out_paths = ['submission.csv']
@@ -1064,7 +1070,7 @@ if os.path.exists('/kaggle/working'):
     out_paths.append('/kaggle/working/submission.csv')
 
 for out_p in out_paths:
-    sub.to_csv(out_p, index=False)
+    sub.to_csv(out_p, index=False, lineterminator='\\n')
     print(f"Exported: {out_p}")
 
 num_buys = int((sub['tp'] > 0).sum())

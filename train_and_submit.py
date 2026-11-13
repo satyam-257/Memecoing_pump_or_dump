@@ -143,15 +143,15 @@ def main():
     test_p = engine.predict_entry(TE)
     
     # Causal per-token execution rule (zero test ranking or peeking)
-    tau_scalar = engine.calibrate_scalar_threshold(TR, min_prob_floor=0.205)
-    print(f"Calibrated causal Stage 1 scalar cutoff on holdout OOF (last 5 training days): tau_base = {tau_scalar:.4f} (break-even floor >= 0.205)")
+    tau_scalar = engine.calibrate_scalar_threshold(TR, min_prob_floor=0.220)
+    print(f"Calibrated causal Stage 1 scalar cutoff on holdout OOF (last 5 training days): tau_base = {tau_scalar:.4f} (break-even floor >= 0.220)")
     test_tp, best_ev = engine.decide_per_token(
         TE, 
         p_entry=test_p, 
         tau_scalar=tau_scalar, 
-        min_prob_floor=0.205, 
+        min_prob_floor=0.220, 
         escalator_step=0.012, 
-        free_trades=8
+        free_trades=4
     )
     
     # Diagnostic: Top 15 predicted tokens in test universe
@@ -201,15 +201,15 @@ def main():
     if os.path.exists(sample_sub_path):
         sample_sub = pd.read_csv(sample_sub_path)
         sub = sample_sub[['mint']].merge(sub, on='mint', how='left')
-        sub['tp'] = sub['tp'].fillna(0.0).astype(float)
+        sub['tp'] = sub['tp'].fillna(0).astype(int)
         assert len(sub) == len(sample_sub), f"Row count mismatch: {len(sub)} vs {len(sample_sub)}"
         assert sub['mint'].equals(sample_sub['mint']), "Mint alignment mismatch"
         
-    valid_tp = (sub['tp'] == 0.0) | ((sub['tp'] >= 3.0) & (sub['tp'] <= 100.0))
+    valid_tp = (sub['tp'] == 0) | ((sub['tp'] >= 3) & (sub['tp'] <= 100))
     assert valid_tp.all(), "Invalid take-profit values found outside allowed competition bounds!"
     
     sub_path = 'submission.csv'
-    sub.to_csv(sub_path, index=False)
+    sub.to_csv(sub_path, index=False, lineterminator='\n')
     
     buys = int((sub['tp'] > 0).sum())
     print(f"\nSuccessfully generated {sub_path}:")
