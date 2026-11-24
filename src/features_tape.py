@@ -248,6 +248,55 @@ def extract_tape_features(c_df, a_df):
     F['drawdown'] = 1.0 - F['at_high']
     F['price_range'] = (p_max / p_min.replace(0, np.nan)) - 1.0
     F['trades_per_wallet'] = F['amm_n'] / np.maximum(F['amm_uw'], 1)
+
+    # Daniro Momentum & Volatility Indicators: Aroon Up/Down/Oscillator, ROC, and ATR Normalization
+    p_valid = a_df[a_df.price > 0].copy()
+    if len(p_valid) > 0:
+        p_valid['lp'] = np.log(p_valid['price'])
+        pg_v = p_valid.groupby('mint', sort=False)
+        hi_val = pg_v['lp'].transform('max')
+        lo_val = pg_v['lp'].transform('min')
+        
+        t_high = p_valid.loc[p_valid['lp'] == hi_val].groupby('mint')['ts_rel'].min()
+        t_low = p_valid.loc[p_valid['lp'] == lo_val].groupby('mint')['ts_rel'].min()
+        
+        # Aroon indicators over the 60-second horizon (0-100 scale)
+        aroon_up = (t_high / 60.0 * 100.0).clip(0.0, 100.0)
+        aroon_down = (t_low / 60.0 * 100.0).clip(0.0, 100.0)
+        F['aroon_up'] = aroon_up.reindex(F.index).fillna(50.0)
+        F['aroon_down'] = aroon_down.reindex(F.index).fillna(50.0)
+        F['aroon_osc'] = (F['aroon_up'] - F['aroon_down']).fillna(0.0)
+        
+        # Rate of Change (ROC) multi-window acceleration
+        p_t0 = pg_v['price'].first()
+        p_t15 = p_valid[p_valid.ts_rel <= 15].groupby('mint')['price'].last()
+        p_t30 = p_valid[p_valid.ts_rel <= 30].groupby('mint')['price'].last()
+        p_t60 = pg_v['price'].last()
+        
+        roc_15 = ((p_t15 - p_t0) / p_t0.replace(0, np.nan) * 100.0).clip(-100.0, 1000.0)
+        roc_30 = ((p_t30 - p_t0) / p_t0.replace(0, np.nan) * 100.0).clip(-100.0, 1000.0)
+        roc_60 = ((p_t60 - p_t0) / p_t0.replace(0, np.nan) * 100.0).clip(-100.0, 1000.0)
+        
+        F['roc_15'] = roc_15.reindex(F.index).fillna(0.0)
+        F['roc_30'] = roc_30.reindex(F.index).fillna(0.0)
+        F['roc_60'] = roc_60.reindex(F.index).fillna(0.0)
+        F['roc_accel'] = (F['roc_60'] - F['roc_30']).fillna(0.0)
+        
+        # Average True Range (ATR) & Volatility Breakout Ratio
+        abs_diff = pg_v['lp'].diff().abs()
+        atr_proxy = abs_diff.groupby(p_valid.mint).mean().reindex(F.index).fillna(0.01)
+        F['atr_vol'] = atr_proxy
+        F['roc_atr_ratio'] = (F['roc_60'] / (F['atr_vol'] * 100.0 + 1e-4)).clip(-50.0, 50.0)
+    else:
+        F['aroon_up'] = 50.0
+        F['aroon_down'] = 50.0
+        F['aroon_osc'] = 0.0
+        F['roc_15'] = 0.0
+        F['roc_30'] = 0.0
+        F['roc_60'] = 0.0
+        F['roc_accel'] = 0.0
+        F['atr_vol'] = 0.01
+        F['roc_atr_ratio'] = 0.0
     
     F['vol'] = a_df.assign(lp=np.log(a_df.price.replace(0, np.nan))).groupby('mint')['lp'].std().reindex(F.index).fillna(0.0)
     

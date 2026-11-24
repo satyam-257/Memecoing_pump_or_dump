@@ -1,0 +1,105 @@
+Over 1M transactions processed, 150+ trading bots analyzed, and 4,700+ strategies studied. But how do you turn someone else's mathematical idea into an algorithm of your own?
+
+In my Polymarket breakdowns, traders use Aroon, CCI, Momentum, ROC and ATR to find BTC signals. Trade histories show results, not the source code or rejected hypotheses
+
+ 
+
+Understanding a formula takes minutes. Turning it into entry rules, exits, risk controls and an honestly tested system is another job entirely
+
+I found Horizon, an AI-powered algorithmic trading platform where you can describe your own quant strategy in plain English, inspect its rules, test them against historical data and refine the result without starting with Python or Pine Script  
+
+What matters isn't just AI writing logic. It's testing why that logic might fail before deploying it live
+
+Two formulas from my bot breakdowns can become one strategy
+
+Take ROC + ATR, a combination similar to one I've covered
+
+ROC (Rate of Change) measures the percentage movement over a chosen window:
+
+ROC = (Current Price - Price N Candles Ago) / Price N Candles Ago Ã 100
+
+BTC rises from $60,000 to $60,600? ROC is +1%, but that alone isn't a trading signal.
+
+ATR (Average True Range) measures the normal size of price swings:
+
+TR = max(High - Low, |High - Previous Close|, |Low - Previous Close|)
+
+ATR = Average TR Over N Candles
+
+If ATR is $300 and BTC moves $600, that movement equals 2 ATR. The idea is to filter ordinary noise instead of reacting to every candle.
+
+Aroon measures something different: how recently the strongest high or low appeared.
+
+Aroon Up = 100 Ã (N - Periods Since Highest High) / N
+
+Aroon Down = 100 Ã (N - Periods Since Lowest Low) / N
+
+Aroon Oscillator = Aroon Up - Aroon Down
+
+Aroon Up above Aroon Down suggests a bullish bias. But where are the entry, exit and risk limits? That's what turns an indicator into a strategy
+
+The research stack I'd build: Horizon + Grok Bot + Claude
+
+Give Grok Bot a public trade-history dataset to investigate. Use Claude to turn the observations into explicit hypotheses. Then use Horizon to test an adapted strategy on supported markets.
+
+Here's a prompt you could give Claude or Grok along with the data:
+
+Analyze this public BTC âUp or Downâ trade history from Polymarket. Group partial limit-order fills so one order isn't counted as multiple independent decisions. Separate one-sided entries from paired Up/Down purchases. Calculate average and median position sizes. Test whether ROC, ATR and Aroon might explain entry timing. Do not treat correlation as proof. Produce precise rules we could test on untouched data.
+
+Then, send the adapted hypothesis about the Quant to Horizon https://join.horizon.trade/Quant:
+
+Build a long-only QQQ momentum strategy on the 1-hour chart. Enter when 10-period ROC is positive, price is above the 50-period EMA, and the latest move exceeds 0.8 Ã ATR(14). Exit on momentum reversal or a 2 Ã ATR trailing stop. Risk at most 0.5% per position. Include realistic fees and slippage. Show the entry rules, trade list and maximum drawdown. Flag any unsupported timeframe or indicator.
+
+ 
+
+Now make AI try to break the strategy it just built
+
+The first backtest is a draft. Before deployment, I'd run four tests:
+
+1. Move the thresholds. If ROC(10) works, try ROC(8) and ROC(12). If 0.8 ATR works, try 0.6 and 1.0. An edge that disappears with a tiny change might be fitted to the past.
+
+2. Remove one rule. Disable ATR, rerun the backtest, then disable the trend filter. This is ablation testing. It shows which conditions carry information and which simply make the code more complicated.
+
+3. Change the regime. Compare trending, sideways and high-volatility periods. A momentum setup may work during sustained moves and struggle when price keeps reversing. Quant researchers also use Hidden Markov Models to study regimes; that doesn't mean Horizon has a built-in HMM module.
+
+4. Stress execution. Increase fees and slippage. Then test the strategy on a historical period that wasn't used to tune it. If its edge disappears, that's more useful than a beautiful equity curve.
+
+Horizon lets you revise and rerun tests, then inspect the metrics:
+
+Sharpe Ratio = (Average Return - Risk-Free Return) / Return Volatility
+
+Edge Factor = Total Positive PnL / Absolute Negative PnL
+
+Max Drawdown = (Equity Peak - Subsequent Equity Trough) / Equity Peak Ã 100
+
+A failed test can save more capital than a successful one makes. You discover which hypothesis shouldn't go live
+
+ 
+
+Case
+
+One guy used Claude Fable 5.1 and Grok Bot to study public Polymarket trades, developed a ROC + ATR hypothesis, tested an adapted version in Horizon, and separately built execution for Polymarket. His bot reportedly reached +$186,977 PnL in 94 days
+
+ 
+
+The point isn't the $186,977. It's the path from public trades to a testable hypothesis before building an execution system
+
+From the backtest to your own trading account
+
+A strategy that looks promising in historical data can move into paper trading. It follows current prices and places simulated orders with virtual capital, so you can inspect entries, exits and risk behavior before switching to live execution
+
+ 
+
+Here is the part that gets interesting
+
+Imagine my next Aroon-bot breakdown. Instead of saving the formula and scrolling on, you ask Claude to turn it into rules. Horizon tests the strategy, exposes weak conditions, and lets you compare the revised version
+
+Claude helps you develop the hypothesis. Horizon makes it a repeatable experiment you can refine and potentially automate. For anyone who studies trading algorithms every day, that's far more useful than another black-box signal generator
+
+You can try putting your first idea into Horizon for free. Discover is enough to explore other creators' strategies and sample the AI. But the moment you want to build, backtest and automatically run your own systems, Builder becomes the relevant plan
+
+The base Builder subscription includes the base monthly AI allowance for strategy creation and backtesting and up to three simultaneously running strategies. It also opens the workflow of editable rules, repeatable tests and automated execution through supported accounts. Paper trading comes first
+
+Instead of coding a new backtester and execution layer for every idea, you pay for a workflow that already exists. Not guaranteed edge. More time to test ideas
+
+âï¸Start with the Quant's formula. Let AI structure the rules. Let the data challenge them: https://join.horizon.trade/Quant
