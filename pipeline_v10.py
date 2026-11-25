@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import lightgbm as lgb
 
-VERSION = 'causal-utility-triple-barrier-v10'
+VERSION = 'causal-utility-dual-v10'
 DAY = 86400
 GAP = 7200
 SEEDS = (17, 43)
@@ -340,7 +340,48 @@ def score(d,day,seed=2026):
     for j,t in enumerate(LEVELS): out[f'ev{int(t)}']=pred[:,j]
     return out
 
-# decide will be placed in dual engine
+def decide(out):
+    """
+    Triple-Barrier Dual-Engine Decision Engine:
+    1. Base Entry Gating:
+       - Requires positive expected edge: ev5 >= 0.20 or ev4 >= 0.22 SOL
+       - AND requires LightGBM Triple-Barrier breakout probability: prob_5x >= 0.20
+       - Base allocation for qualifying tokens: tp = 5.0 (+3.70 SOL net gain on hit).
+       
+    2. High-Conviction Runner Upgrade (Controlled Moonshot Hunting):
+       - Only upgrades to higher multiples when expected utility strongly outperforms TP=5.0:
+         * ev7 > ev5 + 0.35 SOL -> upgrade to tp = 7.0
+         * ev10 > ev5 + 0.65 SOL -> upgrade to tp = 10.0
+         * ev25 > ev5 + 1.25 SOL -> upgrade to tp = 25.0
+       - Strictly prevents low-probability 25x gambling on choppy tokens.
+       
+    3. Capital Preservation Veto:
+       - Tokens failing either hurdle are assigned tp = 0.0 (Costless Skip).
+    """
+    ev = out[[f'ev{int(t)}' for t in LEVELS]].values
+    ev4 = ev[:, 1]
+    ev5 = ev[:, 2]
+    ev7 = ev[:, 3]
+    ev10 = ev[:, 4]
+    ev25 = ev[:, 6]
+    p5x = out['prob_5x'].values if 'prob_5x' in out.columns else np.ones(len(out))
+    
+    # Dual-Engine Barrier Gating: Requires both expected edge AND breakout momentum probability
+    base_mask = ((ev5 >= 0.20) | (ev4 >= 0.22)) & (p5x >= 0.20)
+    tp = np.zeros(len(out), dtype=float)
+    tp[base_mask] = 5.0
+    
+    # Selective runner upgrades with safety margins
+    upgrade_7 = base_mask & (ev7 > ev5 + 0.35)
+    tp[upgrade_7] = 7.0
+    
+    upgrade_10 = base_mask & (ev10 > ev5 + 0.65)
+    tp[upgrade_10] = 10.0
+    
+    upgrade_25 = base_mask & (ev25 > ev5 + 1.25)
+    tp[upgrade_25] = 25.0
+    
+    return tp
 
 
 """Public workflow, self-owned MIT source. Dependencies loaded from a pinned own code input."""
@@ -556,95 +597,38 @@ All scaling is fitted on each fold's earlier labels, never query rows.
 
 ABLATION_SEEDS = (2026, 17, 43)
 
-def score_utility(d, day, scaled=True, seeds=(2026, 17, 43)):
-    tr = d[(d.mt < day - GAP) & (d.mt >= day - 45 * DAY) & d.max_x.notna()]
+def score_utility(d, day, scaled=False, seeds=(2026,)):
+    tr = d[(d.mt < day-GAP) & (d.mt >= day-45*DAY) & d.max_x.notna()]
     va = d[d.day == day]
     cols = features(d)
+    y = np.column_stack([np.minimum(payoff(t, tr.max_x, tr.final_x), 20) for t in LEVELS])
+    weights = 2**(-(day-tr.mt.to_numpy())/(30*DAY))
+    scale = np.ones(len(LEVELS))
+    if scaled:
+        mean = np.average(y, axis=0, weights=weights)
+        scale = np.maximum(np.sqrt(np.average((y-mean)**2, axis=0, weights=weights)), .1)
+    predictions = []
+    for seed in seeds:
+        model = CatBoostRegressor(iterations=420, depth=5, learning_rate=.035,
+            l2_leaf_reg=20, loss_function='MultiRMSE', random_seed=seed,
+            thread_count=4, verbose=False, allow_writing_files=False)
+        model.fit(tr[cols].astype('float32').fillna(-999), y/scale, sample_weight=weights)
+        predictions.append(model.predict(va[cols].astype('float32').fillna(-999))*scale)
+    pred = np.mean(predictions, axis=0)
     
-    # Target 1: Direct multi-level utility matrix
-    y_utility = np.column_stack([np.minimum(payoff(t, tr.max_x, tr.final_x), 20) for t in LEVELS])
-    
-    # Target 2: Triple-Barrier 5x breakout target
+    # LightGBM Triple-Barrier Classifier (P(max_x >= 5.0))
     y_barrier = (tr.max_x >= 5.0).astype(int).values
-    
-    weights = 2**(-(day - tr.mt.to_numpy()) / (30 * DAY))
-    
-    # Variance scaling for utility
-    mean = np.average(y_utility, axis=0, weights=weights)
-    scale = np.maximum(np.sqrt(np.average((y_utility - mean)**2, axis=0, weights=weights)), 0.1)
-    
-    # Engine A: CatBoost MultiRMSE Expected Utility
-    cb_preds = []
-    for s in seeds:
-        cb = CatBoostRegressor(iterations=420, depth=5, learning_rate=0.035, l2_leaf_reg=20,
-                               loss_function='MultiRMSE', random_seed=s, thread_count=4,
-                               verbose=False, allow_writing_files=False)
-        cb.fit(tr[cols].astype('float32').fillna(-999), y_utility / scale, sample_weight=weights)
-        cb_preds.append(cb.predict(va[cols].astype('float32').fillna(-999)) * scale)
-    ev_pred = np.mean(cb_preds, axis=0)
-    
-    # Engine B: LightGBM Triple-Barrier Classifier (P(5x Breakout))
     lgb_clf = lgb.LGBMClassifier(n_estimators=300, learning_rate=0.03, num_leaves=31,
                                  min_child_samples=20, subsample=0.8, colsample_bytree=0.8,
                                  random_state=2026, n_jobs=4, verbose=-1)
     lgb_clf.fit(tr[cols].astype('float32').fillna(-999), y_barrier, sample_weight=weights)
     prob_5x = lgb_clf.predict_proba(va[cols].astype('float32').fillna(-999))[:, 1]
     
-    out = va[['mint', 'mt', 'day', 'max_x', 'final_x']].copy()
+    out = va[['mint','mt','day','max_x','final_x']].copy()
     for j, t in enumerate(LEVELS):
-        out[f'ev{int(t)}'] = ev_pred[:, j]
+        out[f'ev{int(t)}'] = pred[:, j]
     out['prob_5x'] = prob_5x
-    
-    # Also carry forward key risk features for veto gating
-    for col in ['p_dev_sell_ratio', 'p_holder_gini', 'p_depth_drawdown']:
-        if col in va.columns:
-            out[col] = va[col].values
-        else:
-            out[col] = 0.0
-            
     return out
-
-def decide(out):
-    """
-    Triple-Barrier Probability + Risk-Adjusted Utility Gating Engine:
-    
-    1. Base Entry Gating:
-       - Requires elevated breakout probability from LightGBM: prob_5x >= 0.18
-       - Requires positive expected edge from CatBoost: ev5 >= 0.25 or ev4 >= 0.28 SOL
-       - Insiders & Dump Veto: p_dev_sell_ratio < 0.25 (no creator dumping)
-    2. Runner Upgrades:
-       - ev7 > ev5 + 0.35 -> tp = 7.0
-       - ev10 > ev5 + 0.65 -> tp = 10.0
-       - ev25 > ev5 + 1.25 -> tp = 25.0
-    3. Capital Preservation:
-       - Unqualified tokens -> tp = 0.0 (Costless Skip)
-    """
-    ev = out[[f'ev{int(t)}' for t in LEVELS]].values
-    ev4 = ev[:, 1]
-    ev5 = ev[:, 2]
-    ev7 = ev[:, 3]
-    ev10 = ev[:, 4]
-    ev25 = ev[:, 6]
-    p5x = out['prob_5x'].values
-    
-    dev_sell = out['p_dev_sell_ratio'].fillna(0.0).values
-    
-    # Strict Dual-Engine Barrier Gating:
-    base_mask = (p5x >= 0.18) & ((ev5 >= 0.25) | (ev4 >= 0.28)) & (dev_sell < 0.25)
-    
-    tp = np.zeros(len(out), dtype=float)
-    tp[base_mask] = 5.0
-    
-    upgrade_7 = base_mask & (ev7 > ev5 + 0.35)
-    tp[upgrade_7] = 7.0
-    
-    upgrade_10 = base_mask & (ev10 > ev5 + 0.65)
-    tp[upgrade_10] = 10.0
-    
-    upgrade_25 = base_mask & (ev25 > ev5 + 1.25)
-    tp[upgrade_25] = 25.0
-    
-    return tp
 
 def prepare_base(data=None):
     data = Path(data) if data else data_path()
