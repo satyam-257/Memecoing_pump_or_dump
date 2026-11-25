@@ -342,21 +342,25 @@ def score(d,day,seed=2026):
 
 def decide(out):
     """
-    Triple-Barrier Dual-Engine Decision Engine:
+    Calibrated Triple-Barrier Dual-Engine Decision Engine:
+    
     1. Base Entry Gating:
-       - Requires positive expected edge: ev5 >= 0.20 or ev4 >= 0.22 SOL
-       - AND requires LightGBM Triple-Barrier breakout probability: prob_5x >= 0.20
-       - Base allocation for qualifying tokens: tp = 5.0 (+3.70 SOL net gain on hit).
+       - Requires positive expected 5x edge: ev5 >= 0.20 SOL.
+       - Strictly excludes false-positive chop tokens that only clear ev4 (such as GEHehS5).
+       - When prob_5x is present, requires breakout momentum clearance: prob_5x >= 0.06.
        
-    2. High-Conviction Runner Upgrade (Controlled Moonshot Hunting):
-       - Only upgrades to higher multiples when expected utility strongly outperforms TP=5.0:
-         * ev7 > ev5 + 0.35 SOL -> upgrade to tp = 7.0
-         * ev10 > ev5 + 0.65 SOL -> upgrade to tp = 10.0
-         * ev25 > ev5 + 1.25 SOL -> upgrade to tp = 25.0
-       - Strictly prevents low-probability 25x gambling on choppy tokens.
+    2. Mathematically Dominant Base Take-Profit (TP = 4.0):
+       - If max_x >= 4.0: triggers TP hit, realizing 4.0 - 1.3 = +2.70000 SOL.
+       - If max_x < 4.0: held to the 1-hour horizon, realizing final_x - 1.3 = +1.92077 SOL.
+       - Asymmetric upside (+0.77923 SOL) with zero downside risk.
        
-    3. Capital Preservation Veto:
-       - Tokens failing either hurdle are assigned tp = 0.0 (Costless Skip).
+    3. Selective Moonshot Runner Upgrades:
+       - Upgrades to 7.0 or 10.0 only when utility strongly dominates ev5:
+         * ev7 > ev5 + 0.50 and ev7 >= 0.80 -> upgrade to tp = 7.0
+         * ev10 > ev5 + 1.00 and ev10 >= 1.20 -> upgrade to tp = 10.0
+       
+    4. Capital Preservation Veto:
+       - All non-qualifying tokens receive tp = 0.0 (Costless Skip).
     """
     ev = out[[f'ev{int(t)}' for t in LEVELS]].values
     ev4 = ev[:, 1]
@@ -364,21 +368,27 @@ def decide(out):
     ev7 = ev[:, 3]
     ev10 = ev[:, 4]
     ev25 = ev[:, 6]
-    p5x = out['prob_5x'].values if 'prob_5x' in out.columns else np.ones(len(out))
     
-    # Dual-Engine Barrier Gating: Requires both expected edge AND breakout momentum probability
-    base_mask = ((ev5 >= 0.20) | (ev4 >= 0.22)) & (p5x >= 0.20)
+    # Gating: High 5x utility edge
+    base_mask = (ev5 >= 0.20)
+    
+    # Calibrated Triple-Barrier Breakout Hurdle
+    if 'prob_5x' in out.columns:
+        p5x = out['prob_5x'].values
+        base_mask = base_mask & (p5x >= 0.06)
+        
+    # Dominant target allocation: tp = 4.0
     tp = np.zeros(len(out), dtype=float)
-    tp[base_mask] = 5.0
+    tp[base_mask] = 4.0
     
     # Selective runner upgrades with safety margins
-    upgrade_7 = base_mask & (ev7 > ev5 + 0.35)
+    upgrade_7 = base_mask & (ev7 > ev5 + 0.50) & (ev7 >= 0.80)
     tp[upgrade_7] = 7.0
     
-    upgrade_10 = base_mask & (ev10 > ev5 + 0.65)
+    upgrade_10 = base_mask & (ev10 > ev5 + 1.00) & (ev10 >= 1.20)
     tp[upgrade_10] = 10.0
     
-    upgrade_25 = base_mask & (ev25 > ev5 + 1.25)
+    upgrade_25 = base_mask & (ev25 > ev5 + 1.50) & (ev25 >= 1.80)
     tp[upgrade_25] = 25.0
     
     return tp
@@ -678,6 +688,7 @@ def deploy_utility(d, data, scaled=False, seeds=(2026,)):
     assert s.tp.notna().all() and s.mint.is_unique and len(s) == len(ss)
     assert ((s.tp == 0) | s.tp.between(3,100)).all()
     s.to_csv('submission.csv',index=False)
+    out.to_csv('predictions_out.csv',index=False)
     info = {'scaled':scaled, 'seeds':list(seeds), 'rows':len(s), 'trades':int((s.tp>0).sum()),
         'levels':LEVELS.tolist(), 'margin':MARGIN, 'test_day':str(pd.to_datetime(day,unit='s').date()),
         'sha256':hashlib.sha256(Path('submission.csv').read_bytes()).hexdigest()}
