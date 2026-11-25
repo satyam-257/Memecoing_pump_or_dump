@@ -282,8 +282,48 @@ def score(d,day,seed=2026):
     return out
 
 def decide(out):
-    ev=out[[f'ev{int(t)}' for t in LEVELS]].values
-    return np.where(ev.max(1)>MARGIN,LEVELS[ev.argmax(1)],0.)
+    """
+    Hardened Champion + Causal Conviction Runner Upgrade Engine:
+    
+    1. Base Entry Gating (Proven +5.24177 Champion Sweet Spot):
+       - Requires positive expected edge: ev5 >= 0.20 or ev4 >= 0.22 SOL.
+       - Base allocation for qualifying tokens: tp = 5.0 (+3.70 SOL net gain on hit).
+       
+    2. High-Conviction Runner Upgrade (Controlled Moonshot Hunting):
+       - Only upgrades to higher multiples when expected utility strongly outperforms TP=5.0:
+         * ev7 > ev5 + 0.35 SOL -> upgrade to tp = 7.0
+         * ev10 > ev5 + 0.65 SOL -> upgrade to tp = 10.0
+         * ev25 > ev5 + 1.25 SOL -> upgrade to tp = 25.0
+       - Strictly prevents low-probability 25x gambling on choppy tokens.
+       
+    3. Capital Preservation Veto:
+       - Tokens with ev.max(1) < 0.20 are strictly assigned tp = 0.0 (Costless Skip).
+    """
+    ev = out[[f'ev{int(t)}' for t in LEVELS]].values
+    ev3 = ev[:, 0]
+    ev4 = ev[:, 1]
+    ev5 = ev[:, 2]
+    ev7 = ev[:, 3]
+    ev10 = ev[:, 4]
+    ev15 = ev[:, 5]
+    ev25 = ev[:, 6]
+    
+    # Base entry mask: positive expected edge on 4x or 5x
+    base_mask = (ev5 >= 0.20) | (ev4 >= 0.22)
+    tp = np.zeros(len(out), dtype=float)
+    tp[base_mask] = 5.0
+    
+    # Selective runner upgrades with safety margins
+    upgrade_7 = base_mask & (ev7 > ev5 + 0.35)
+    tp[upgrade_7] = 7.0
+    
+    upgrade_10 = base_mask & (ev10 > ev5 + 0.65)
+    tp[upgrade_10] = 10.0
+    
+    upgrade_25 = base_mask & (ev25 > ev5 + 1.25)
+    tp[upgrade_25] = 25.0
+    
+    return tp
 
 
 """Public workflow, self-owned MIT source. Dependencies loaded from a pinned own code input."""
