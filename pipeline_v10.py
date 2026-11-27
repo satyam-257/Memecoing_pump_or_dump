@@ -342,53 +342,53 @@ def score(d,day,seed=2026):
 
 def decide(out):
     """
-    Calibrated Triple-Barrier Dual-Engine Decision Engine:
+    Calibrated Multi-Tier Triple-Barrier Decision Engine:
     
-    1. Base Entry Gating:
-       - Requires positive expected 5x edge: ev5 >= 0.20 SOL.
-       - Strictly excludes false-positive chop tokens that only clear ev4 (such as GEHehS5).
-       - When prob_5x is present, requires breakout momentum clearance: prob_5x >= 0.06.
+    1. Multi-Tier Entry Gating:
+       - Tier 5 (High Breakout Runner): ev5 >= 0.15 and prob_5x >= 0.06 -> tp = 5.0
+       - Tier 4 (Strong Momentum Accumulator): ev4 >= 0.18 and prob_5x >= 0.05 -> tp = 4.0
+       - Tier 3 (High-Probability Base): ev3 >= 0.20 and prob_5x >= 0.04 -> tp = 3.0
        
-    2. Mathematically Dominant Base Take-Profit (TP = 4.0):
-       - If max_x >= 4.0: triggers TP hit, realizing 4.0 - 1.3 = +2.70000 SOL.
-       - If max_x < 4.0: held to the 1-hour horizon, realizing final_x - 1.3 = +1.92077 SOL.
-       - Asymmetric upside (+0.77923 SOL) with zero downside risk.
-       
-    3. Selective Moonshot Runner Upgrades:
-       - Upgrades to 7.0 or 10.0 only when utility strongly dominates ev5:
-         * ev7 > ev5 + 0.50 and ev7 >= 0.80 -> upgrade to tp = 7.0
-         * ev10 > ev5 + 1.00 and ev10 >= 1.20 -> upgrade to tp = 10.0
-       
-    4. Capital Preservation Veto:
+    2. Selective Moonshot Runner Upgrades:
+       - For qualifying tokens, upgrade only when utility strongly dominates ev5:
+         * ev7 > ev5 + 0.40 and ev7 >= 0.60 -> upgrade to tp = 7.0
+         * ev10 > ev5 + 0.80 and ev10 >= 1.00 -> upgrade to tp = 10.0
+         * ev25 > ev5 + 1.25 and ev25 >= 1.50 -> upgrade to tp = 25.0
+         
+    3. Capital Preservation Veto:
        - All non-qualifying tokens receive tp = 0.0 (Costless Skip).
     """
     ev = out[[f'ev{int(t)}' for t in LEVELS]].values
+    ev3 = ev[:, 0]
     ev4 = ev[:, 1]
     ev5 = ev[:, 2]
     ev7 = ev[:, 3]
     ev10 = ev[:, 4]
     ev25 = ev[:, 6]
+    p5x = out['prob_5x'].values if 'prob_5x' in out.columns else np.full(len(out), 0.05)
     
-    # Gating: High 5x utility edge
-    base_mask = (ev5 >= 0.20)
-    
-    # Calibrated Triple-Barrier Breakout Hurdle
-    if 'prob_5x' in out.columns:
-        p5x = out['prob_5x'].values
-        base_mask = base_mask & (p5x >= 0.06)
-        
-    # Dominant target allocation: tp = 4.0
     tp = np.zeros(len(out), dtype=float)
-    tp[base_mask] = 4.0
     
-    # Selective runner upgrades with safety margins
-    upgrade_7 = base_mask & (ev7 > ev5 + 0.50) & (ev7 >= 0.80)
+    # Tier 3 allocation: Base accumulation
+    mask_3 = (ev3 >= 0.20) & (p5x >= 0.04)
+    tp[mask_3] = 3.0
+    
+    # Tier 4 allocation: Strong momentum
+    mask_4 = (ev4 >= 0.18) & (p5x >= 0.05)
+    tp[mask_4] = 4.0
+    
+    # Tier 5 allocation: Breakout runner
+    mask_5 = (ev5 >= 0.15) & (p5x >= 0.06)
+    tp[mask_5] = 5.0
+    
+    # Selective runner upgrades for Tier 5 candidates
+    upgrade_7 = mask_5 & (ev7 > ev5 + 0.40) & (ev7 >= 0.60)
     tp[upgrade_7] = 7.0
     
-    upgrade_10 = base_mask & (ev10 > ev5 + 1.00) & (ev10 >= 1.20)
+    upgrade_10 = mask_5 & (ev10 > ev5 + 0.80) & (ev10 >= 1.00)
     tp[upgrade_10] = 10.0
     
-    upgrade_25 = base_mask & (ev25 > ev5 + 1.50) & (ev25 >= 1.80)
+    upgrade_25 = mask_5 & (ev25 > ev5 + 1.25) & (ev25 >= 1.50)
     tp[upgrade_25] = 25.0
     
     return tp
